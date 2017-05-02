@@ -100,13 +100,22 @@ def evaluate(dataset, predictions):
     
     print(len(ans_dist), len(ans_comma), len(pred_dist), len(pred_comma))
     
+    bins = np.linspace(0, 200, 40)
+
     plt.figure()
-    plt.hist([ans_dist, pred_dist], 50, color = ['r','b'], alpha = 0.5)
-    plt.savefig('dist.png')
+    plt.hist(ans_dist, bins, color = 'r', alpha = 0.5)
+    plt.hist(pred_dist, bins, color = 'b', alpha = 0.5)
+    plt.legend(['ground truth', 'prediction'])
+    plt.xlabel('answer length')
+    plt.ylabel('#answers')
+    plt.savefig('dist.pdf')
+    
+    bins = np.linspace(0, 20, 15)
     
     plt.figure()
-    plt.hist([ans_comma, pred_comma], 20, color = ['r','b'], alpha = 0.5)
-    plt.savefig('comma.png')
+    plt.hist(ans_comma, bins, color = 'r', alpha = 0.5)
+    plt.hist(pred_comma, bins, color = 'b', alpha = 0.5)
+    plt.savefig('comma.pdf')
     
 
     return {'exact_match': exact_match, 'f1': f1}

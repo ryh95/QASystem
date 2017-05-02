@@ -18,6 +18,7 @@ from qa_model import Encoder, QASystem, Decoder
 from preprocessing.squad_preprocess import data_from_json, maybe_download, squad_base_url, \
     invert_map, tokenize, token_idx_map
 from utils.data_reader import preprocess_dataset, load_glove_embeddings
+from utils import util
 import qa_data
 
 import logging
@@ -29,7 +30,7 @@ FLAGS = tf.app.flags.FLAGS
 tf.app.flags.DEFINE_float("learning_rate", 0.005, "Learning rate.")
 tf.app.flags.DEFINE_float("max_gradient_norm", 10.0, "Clip gradients to this norm.")
 tf.app.flags.DEFINE_float("dropout", 0.15, "Fraction of units randomly dropped on non-recurrent connections.")
-tf.app.flags.DEFINE_integer("batch_size", 24, "Batch size to use during training.")
+tf.app.flags.DEFINE_integer("batch_size", 32, "Batch size to use during training.")
 tf.app.flags.DEFINE_integer("epochs", 0, "Number of epochs to train.")
 tf.app.flags.DEFINE_integer("state_size", 200, "Size of each model layer.")
 tf.app.flags.DEFINE_integer("embedding_size", 100, "Size of the pretrained vocabulary.")
@@ -79,7 +80,7 @@ def initialize_vocab(vocab_path):
         raise ValueError("Vocabulary file %s not found.", vocab_path)
 
 
-def read_dataset(dataset, tier, vocab):
+def read_dataset(dataset, tier, vocab, maxlen = None):
     """Reads the dataset, extracts context, question, answer,
     and answer pointer in their own file. Returns the number
     of questions and answers processed for the dataset"""
@@ -87,8 +88,12 @@ def read_dataset(dataset, tier, vocab):
     context_data = []
     query_data = []
     question_uuid_data = []
+    l = len(dataset['data'])
 
-    for articles_id in tqdm(range(len(dataset['data'])), desc="Preprocessing {}".format(tier)):
+    if maxlen:
+        l = maxlen
+
+    for articles_id in tqdm(range(l), desc="Preprocessing {}".format(tier)):
         article_paragraphs = dataset['data'][articles_id]['paragraphs']
         for pid in range(len(article_paragraphs)):
             context = article_paragraphs[pid]['context']
@@ -196,8 +201,7 @@ def expand_vocab(prefix, dev_filename, vocab, embd, raw_glove, raw_glove_vocab):
     #return context_data, question_data, question_uuid_data
     _, dim = embd.shape
     new_glove = np.random.randn(len(vocab), dim)
-    #new_glove = np.zeros((len(vocab), dim))
-    #new_glove[:vn, :] = embd
+    new_glove[:vn, :] = embd
 
     found = 0
     for i in range(vn, vn+(len(new_vocab))):
@@ -205,15 +209,15 @@ def expand_vocab(prefix, dev_filename, vocab, embd, raw_glove, raw_glove_vocab):
         if word in raw_glove_vocab:
             found += 1
             idx = raw_glove_vocab[word]
-            #new_glove[i, :] = raw_glove[idx, :]
+            new_glove[i, :] = raw_glove[idx, :]
         if word.capitalize() in raw_glove_vocab:
             found += 1
             idx = raw_glove_vocab[word.capitalize()]
-            #new_glove[i, :] = raw_glove[idx, :]
+            new_glove[i, :] = raw_glove[idx, :]
         if word.upper() in raw_glove_vocab:
             found += 1
             idx = raw_glove_vocab[word.upper()]
-            #new_glove[i, :] = raw_glove[idx, :]
+            new_glove[i, :] = raw_glove[idx, :]
     #from IPython import embed; embed()
     print("{} unseen words found embeddings".format(found))
 
@@ -237,6 +241,101 @@ def preprocessing(context_data, question_data, context_maxlen, question_maxlen):
     logging.debug("Max question length %d" % max_q_len)
     logging.debug("Max context length %d" % max_c_len)
     return dataset
+
+def generate_answers_raw(sess, model, dataset, rev_vocab):
+    """
+    Loop over the dev or test dataset and generate answer.
+
+    Note: output format must be answers[uuid] = "real answer"
+    You must provide a string of words instead of just a list, or start and end index
+
+    In main() function we are dumping onto a JSON file
+
+    evaluate.py will take the output JSON along with the original JSON file
+    and output a F1 and EM
+
+    You must implement this function in order to submit to Leaderboard.
+
+    :param sess: active TF session
+    :param model: a built QASystem model
+    :param rev_vocab: this is a list of vocabulary that maps index to actual words
+    :return:
+    """
+    answers = {}
+
+    mydata, context_data, context_len_data, question_uuid_data = dataset
+    predicts = model.predict_on_batch_raw(sess, mydata)
+
+    #for i, uuid in enumerate(question_uuid_data):
+    #    start, end = predicts[i]
+
+    #    context_length = context_len_data[i]
+    #    context = strip(context_data[i])
+    #    end = min(end, context_length - 1)
+    #    if start <= end:
+    #        predict_answer = ' '.join(rev_vocab[vocab_index] for vocab_index in context[start : end + 1])
+    #    else:
+    #        predict_answer = ''
+    #    answers[uuid] = predict_answer
+
+    return predicts
+
+
+def ensemble_answers2(preds, dataset, rev_vocab):
+
+    answers = {}
+    mydata, context_data, context_len_data, question_uuid_data = dataset
+    print('ensemble {} models'.format(len(preds)))
+    nmodels = len(preds)
+
+    for i, uuid in enumerate(question_uuid_data):
+
+        logit_start = np.mean(np.array([preds[n][i][0] for n in range(nmodels)]), axis = 0)
+        logit_end = np.mean(np.array([preds[n][i][1] for n in range(nmodels)]), axis = 0)
+        context_batch = preds[0][i][2]
+
+
+        start, end = util.get_best_span(logit_start, logit_end, context_batch)[0]
+
+        context_length = context_len_data[i]
+        context = strip(context_data[i])
+        end = min(end, context_length - 1)
+        if start <= end:
+            predict_answer = ' '.join(rev_vocab[vocab_index] for vocab_index in context[start : end + 1])
+        else:
+            predict_answer = ''
+        answers[uuid] = predict_answer
+
+    return answers
+
+def ensemble_answers(preds, dataset, rev_vocab):
+
+    answers = {}
+    mydata, context_data, context_len_data, question_uuid_data = dataset
+    print('ensemble {} models'.format(len(preds)))
+    nmodels = len(preds)
+
+    for i, uuid in enumerate(question_uuid_data):
+
+        logit_start = np.mean(np.array([preds[n][i][0] for n in range(nmodels)]), axis = 0)
+        logit_end = np.mean(np.array([preds[n][i][1] for n in range(nmodels)]), axis = 0)
+        context_batch = preds[0][i][2]
+
+
+        start, end = util.get_best_span(logit_start, logit_end, context_batch)[0]
+
+        context_length = context_len_data[i]
+        context = strip(context_data[i])
+        end = min(end, context_length - 1)
+        if start <= end:
+            predict_answer = ' '.join(rev_vocab[vocab_index] for vocab_index in context[start : end + 1])
+        else:
+            predict_answer = ''
+        answers[uuid] = predict_answer
+
+    return answers
+
+
 
 def generate_answers(sess, model, dataset, rev_vocab):
     """
@@ -340,17 +439,26 @@ def main(_):
     #encoder = Encoder(vocab_dim=FLAGS.embedding_size, state_size = FLAGS.encoder_state_size)
     #decoder = Decoder(output_size=FLAGS.output_size, hidden_size = FLAGS.decoder_hidden_size, state_size = FLAGS.decoder_state_size)
 
-
     qa = QASystem(embeddings, FLAGS)
+    train_dir = get_normalized_train_dir(FLAGS.train_dir)
+    models = os.listdir(train_dir)
+    print(models)
 
-    with tf.Session() as sess:
-        train_dir = get_normalized_train_dir(FLAGS.train_dir)
-        initialize_model(sess, qa, train_dir)
-        answers = generate_answers(sess, qa, dataset, rev_vocab)
+    all_answers  = []
+    for item in models:
+        with tf.Session() as sess:
+            with tf.variable_scope('test') as v:
+                initialize_model(sess, qa, train_dir + '/' + item)
+                preds = generate_answers_raw(sess, qa, dataset, rev_vocab)
+            # write to json file to root dir
+            all_answers.append(preds)
+            #with io.open('dev-prediction-' + item + '.json', 'w', encoding='utf-8') as f:
+            #    f.write(unicode(json.dumps(answers, ensure_ascii=False)))
 
-        # write to json file to root dir
-        with io.open('dev-prediction.json', 'w', encoding='utf-8') as f:
-            f.write(unicode(json.dumps(answers, ensure_ascii=False)))
+    from IPython import embed; embed()
+    answers = ensemble_answers(all_answers, dataset, rev_vocab)
+    with io.open('dev-prediction.json', 'w', encoding='utf-8') as f:
+        f.write(unicode(json.dumps(answers, ensure_ascii=False)))
 
 
 if __name__ == "__main__":

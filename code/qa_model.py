@@ -214,7 +214,7 @@ class Decoder(object):
         s = softmax_mask_prepro(s, context_mask)
 
         print(s.get_shape())
-        
+
         s_prob = tf.nn.softmax(s)
 
         print(s_prob.get_shape())
@@ -278,7 +278,7 @@ class Decoder(object):
         pred1 = tf.reshape(pred1, shape = [-1, JX])
         tf.summary.histogram('logit_start', pred1)
         return pred1
-    
+
     def get_logit_start_end(self, X, JX):
         d = X.get_shape().as_list()[-1]
         X = tf.reshape(X, shape = [-1, d])
@@ -327,7 +327,7 @@ class QASystem(object):
         # ==== assemble pieces ====
         with tf.variable_scope("qa", initializer=tf.uniform_unit_scaling_initializer(1.0)):
             self.q, self.x = self.setup_embeddings()
-            self.preds = self.setup_system(self.x, self.q)
+            self.preds, self.h, self.u = self.setup_system(self.x, self.q)
             self.loss = self.setup_loss(self.preds)
 
         # ==== set up training/updating procedure ====
@@ -394,7 +394,7 @@ class QASystem(object):
         # 2 LSTM layers
         # logistic regressions
         pred1, pred2 = self.decoder.decode(g, self.context_mask_placeholder, dropout = self.dropout_placeholder, JX = self.JX)
-        return pred1, pred2
+        return (pred1, pred2), h,u
 
     def setup_loss(self, preds):
         with vs.variable_scope("loss"):
@@ -498,6 +498,26 @@ class QASystem(object):
         outputs = session.run(output_feed, input_feed)
         return outputs
 
+    def answer_raw(self, session, test_batch):
+        """
+        Returns the probability distribution over different positions in the paragraph
+        so that other methods like self.answer() will be able to work properly
+        :return:
+        """
+
+        # fill in this feed_dictionary like:
+        # input_feed['test_x'] = test_x
+
+        question_batch, question_len_batch, context_batch, context_len_batch, answer_batch = test_batch
+        input_feed =  self.create_feed_dict(question_batch, question_len_batch, context_batch, context_len_batch, answer_batch=None, is_train = False)
+        output_feed = [self.preds[0], self.preds[1]]
+        outputs = session.run(output_feed, input_feed)
+        s,e = outputs
+
+        outputs = zip(s, e, context_batch)
+
+        return outputs
+
     def answer(self, session, test_batch):
         """
         Returns the probability distribution over different positions in the paragraph
@@ -524,6 +544,16 @@ class QASystem(object):
         predicts = []
         for i, batch in tqdm(enumerate(minibatches(dataset, self.config.batch_size, shuffle=False))):
             pred = self.answer(session, batch)
+            # prog.update(i + 1)
+            predicts.extend(pred)
+        return predicts
+
+    def predict_on_batch_raw(self, session, dataset):
+        batch_num = int(np.ceil(len(dataset) * 1.0 / self.config.batch_size))
+        # prog = Progbar(target=batch_num)
+        predicts = []
+        for i, batch in tqdm(enumerate(minibatches(dataset, self.config.batch_size, shuffle=False))):
+            pred = self.answer_raw(session, batch)
             # prog.update(i + 1)
             predicts.extend(pred)
         return predicts
