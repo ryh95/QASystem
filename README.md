@@ -1,3 +1,13 @@
+# Project abstract
+For the Assignment 4 of CS 224n course, we did a reimplementation of the Bi-Directional attention flow model (BiDAF). We built the architecture from scratch, tuned the network and tried different regularization and out-of-vocabulary han- dling strategies. Eventually, we are able to get F1 score 76.5 and EM 66.3 on test set with our ensemble model of five single models. More info of this project can be found in:
+* question-answering-system.pdf
+* poster.pdf
+
+
+
+
+
+
 # Programming Assignment 4
 ## How to train
 Remember to change the parameters in `code/train.py`. Run your model by:
