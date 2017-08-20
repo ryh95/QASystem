@@ -7,10 +7,10 @@ import json
 
 import tensorflow as tf
 
-from code.qa_model import Encoder, QASystem, Decoder
+from my_code.qa_model import Encoder, QASystem, Decoder
 from os.path import join as pjoin
 
-from code.utils.data_reader import read_data, load_glove_embeddings
+from my_code.utils.data_reader import read_data, load_glove_embeddings
 
 import logging
 

@@ -41,25 +41,7 @@ def load_glove_embeddings(embed_path):
     logger.info("Vocabulary: {}" .format(glove.shape[0]))
     return glove
 
-def add_paddings(sentence, max_length, n_features=1):
-    mask = [True] * len(sentence)
-    pad_len = max_length - len(sentence)
-    if pad_len > 0:
-        padded_sentence = sentence + [0] * pad_len
-        mask += [False] * pad_len
-    else:
-        padded_sentence = sentence[:max_length]
-        mask = mask[:max_length]
-    return padded_sentence, mask
 
-def preprocess_dataset(dataset, question_maxlen, context_maxlen):
-    processed = []
-    for q, q_len, c, c_len, ans in dataset:
-        # add padding:
-        q_padded, q_mask = add_paddings(q, question_maxlen)
-        c_padded, c_mask = add_paddings(c, context_maxlen)
-        processed.append([q_padded, q_mask, c_padded, c_mask, ans])
-    return processed
 
 def strip(x):
     return map(int, x.strip().split(" "))
@@ -75,6 +57,8 @@ def read_data(data_dir, small_dir=None, small_val = None, question_maxlen=None, 
     with gfile.GFile(config.train_question_file, mode="rb") as q_file, \
          gfile.GFile(config.train_context_file, mode="rb") as c_file, \
          gfile.GFile(config.train_answer_span_file, mode="rb") as a_file:
+            # Todo: why use sorted files ? ids.question_sorted ids.context_sorted span_sorted
+            # Reason : This is because of padding mechanism according to create_feed_dict function
             for (q, c, a) in zip(q_file, c_file, a_file):
                 question = strip(q)
                 context = strip(c)

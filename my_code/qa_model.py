@@ -6,29 +6,19 @@ import time, datetime
 import logging
 
 from tensorflow.python.ops.rnn_cell import _linear
+from tensorflow.python.util.nest import is_sequence
 from tqdm import tqdm
 import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 from operator import mul
 from tensorflow.python.ops import variable_scope as vs
-from code.utils.util import ConfusionMatrix, Progbar, minibatches, one_hot, minibatch, get_best_span
+from .utils.util import ConfusionMatrix, Progbar, minibatches, one_hot, minibatch, get_best_span
 
-from code.evaluate import exact_match_score, f1_score
+from .evaluate import exact_match_score, f1_score
 
 logging.basicConfig(level=logging.INFO)
 
-def variable_summaries(var):
-  """Attach a lot of summaries to a Tensor (for TensorBoard visualization)."""
-  with tf.name_scope('summaries'):
-    mean = tf.reduce_mean(var)
-    tf.summary.scalar('mean', mean)
-    with tf.name_scope('stddev'):
-      stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
-    tf.summary.scalar('stddev', stddev)
-    tf.summary.scalar('max', tf.reduce_max(var))
-    tf.summary.scalar('min', tf.reduce_min(var))
-    tf.summary.histogram('histogram', var)
 
 # No gradient clipping:
 def get_optimizer(opt):
@@ -98,7 +88,8 @@ class Attention(object):
         h_mask_aug = tf.tile(tf.expand_dims(h_mask, -1), [1, 1, JQ]) # [N, JX] -(expend)-> [N, JX, 1] -(tile)-> [N, JX, JQ]
         u_mask_aug = tf.tile(tf.expand_dims(u_mask, -2), [1, JX, 1]) # [N, JQ] -(expend)-> [N, 1, JQ] -(tile)-> [N, JX, JQ]
         # s = tf.reduce_sum(tf.multiply(h_aug, u_aug), axis = -1) # h * u: [N, JX, d_en] * [N, JQ, d_en] -> [N, JX, JQ]
-        s = self.get_logits([h_aug, u_aug], None, True, is_train=(dropout<1.0), func='tri_linear', input_keep_prob=dropout)  # [N, M, JX, JQ]
+        # Todo: Why use get_logits instead of multiply directly?
+        s = self.get_logits([h_aug, u_aug], None, True, is_train=(dropout<1.0), func='tri_linear', input_keep_prob=dropout)  # [N, JX, JQ]
         hu_mask_aug = h_mask_aug & u_mask_aug
         s = softmax_mask_prepro(s, hu_mask_aug)
 
@@ -106,6 +97,7 @@ class Attention(object):
         a_x = tf.nn.softmax(s, dim=-1) # softmax -> [N, JX, softmax(JQ)]
 
         #     use a_x to get u_a
+        # Todo: why do matrix multiply in this way
         a_x = tf.reshape(a_x, shape = [-1, JX, JQ, 1])
         u_aug = tf.reshape(u, shape = [-1, 1, JQ, d_en])
         u_a = tf.reduce_sum(tf.multiply(a_x, u_aug), axis = -2)# a_x * u: [N, JX, JQ](weight) * [N, JQ, d_en] -> [N, JX, d_en]
@@ -127,15 +119,15 @@ class Attention(object):
         return tf.concat(2,[h, u_a, h_0_u_a, h_0_h_a])
 
     # this function is from https://github.com/allenai/bi-att-flow/tree/master/my/tensorflow
-    def get_logits(args, size, bias, bias_start=0.0, scope=None, mask=None, wd=0.0, input_keep_prob=1.0, is_train=None, func=None):
+    def get_logits(self,args, size, bias, bias_start=0.0, scope=None, mask=None, wd=0.0, input_keep_prob=1.0, is_train=None, func=None):
 
         def linear_logits(args, bias, bias_start=0.0, scope=None, mask=None, wd=0.0, input_keep_prob=1.0, is_train=None):
 
             def linear(args, output_size, bias, bias_start=0.0, scope=None, squeeze=False, wd=0.0, input_keep_prob=1.0,
                        is_train=None):
-                if args is None or (tf.nest.is_sequence(args) and not args):
+                if args is None or (is_sequence(args) and not args):
                     raise ValueError("`args` must be specified")
-                if not tf.nest.is_sequence(args):
+                if not is_sequence(args):
                     args = [args]
 
                 def flatten(tensor, keep):
@@ -266,7 +258,7 @@ class Decoder(object):
         # assert m_2.get_shape().as_list() == [None, JX, d_en2]
 
         with tf.variable_scope('start'):
-            s = self.get_logit(m_2, JX) #[N, JX]*2
+            s = self.get_logit(m_2, JX) #[N, JX]
         # or s, e = self.get_logit_start_end(m_2) #[N, JX]*2
         s = softmax_mask_prepro(s, context_mask)
 
@@ -280,7 +272,7 @@ class Decoder(object):
 
         e_input = tf.concat(2, [m_2, m_2 * s_prob, s_prob])
         with tf.variable_scope('end'):
-            e = self.get_logit(e_input, JX) #[N, JX]*2
+            e = self.get_logit(e_input, JX) #[N, JX]
 
         e = softmax_mask_prepro(e, context_mask)
         return (s, e)
@@ -585,15 +577,6 @@ class QASystem(object):
             predicts.extend(pred)
         return predicts
 
-    def predict_on_batch(self, session, dataset):
-        batch_num = int(np.ceil(len(dataset) * 1.0 / self.config.batch_size))
-        # prog = Progbar(target=batch_num)
-        predicts = []
-        for i, batch in tqdm(enumerate(minibatches(dataset, self.config.batch_size, shuffle=False))):
-            pred = self.answer(session, batch)
-            # prog.update(i + 1)
-            predicts.extend(pred)
-        return predicts
 
     def validate(self, sess, valid_dataset):
         """
@@ -637,6 +620,7 @@ class QASystem(object):
                 predict_answer = ' '.join(context_words[start : end + 1])
             else:
                 predict_answer = ''
+            # predict_answer and true_answer should be token string
             f1 += f1_score(predict_answer, true_answer)
             em += exact_match_score(predict_answer, true_answer)
 
