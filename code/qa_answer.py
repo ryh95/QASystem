@@ -14,11 +14,11 @@ import numpy as np
 from six.moves import xrange
 import tensorflow as tf
 
-from qa_model import Encoder, QASystem, Decoder
-from preprocessing.squad_preprocess import data_from_json, maybe_download, squad_base_url, \
+from code import qa_data
+from code.qa_model import Encoder, QASystem, Decoder
+from code.preprocessing.squad_preprocess import data_from_json, maybe_download, squad_base_url, \
     invert_map, tokenize, token_idx_map
-from utils.data_reader import preprocess_dataset, load_glove_embeddings
-import qa_data
+from code.utils.data_reader import preprocess_dataset, load_glove_embeddings
 
 import logging
 

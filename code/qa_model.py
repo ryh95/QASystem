@@ -4,15 +4,17 @@ from __future__ import print_function
 
 import time, datetime
 import logging
+
+from tensorflow.python.ops.rnn_cell import _linear
 from tqdm import tqdm
 import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 from operator import mul
 from tensorflow.python.ops import variable_scope as vs
-from utils.util import ConfusionMatrix, Progbar, minibatches, one_hot, minibatch, get_best_span
+from code.utils.util import ConfusionMatrix, Progbar, minibatches, one_hot, minibatch, get_best_span
 
-from evaluate import exact_match_score, f1_score
+from code.evaluate import exact_match_score, f1_score
 
 logging.basicConfig(level=logging.INFO)
 
@@ -131,9 +133,9 @@ class Attention(object):
 
             def linear(args, output_size, bias, bias_start=0.0, scope=None, squeeze=False, wd=0.0, input_keep_prob=1.0,
                        is_train=None):
-                if args is None or (nest.is_sequence(args) and not args):
+                if args is None or (tf.nest.is_sequence(args) and not args):
                     raise ValueError("`args` must be specified")
-                if not nest.is_sequence(args):
+                if not tf.nest.is_sequence(args):
                     args = [args]
 
                 def flatten(tensor, keep):
@@ -429,8 +431,8 @@ class QASystem(object):
                      self.encoder.encode(inputs=x, mask=self.context_mask_placeholder, encoder_state_input=None, dropout = self.dropout_placeholder)
                  # self.encoder.encode(inputs=x, mask=self.context_mask_placeholder, encoder_state_input=None)
         d_en = self.config.encoder_state_size*2
-        assert h.get_shape().as_list() == [None, None, d_en], "Expected {}, got {}".format([None, JX, d_en], h.get_shape().as_list())
-        assert u.get_shape().as_list() == [None, None, d_en], "Expected {}, got {}".format([None, JQ, d_en], u.get_shape().as_list())
+        assert h.get_shape().as_list() == [None, None, d_en], "Expected {}, got {}".format([None, self.JX, d_en], h.get_shape().as_list())
+        assert u.get_shape().as_list() == [None, None, d_en], "Expected {}, got {}".format([None, self.JQ, d_en], u.get_shape().as_list())
 
 
         # Step 2: combine H and U using "Attention"
@@ -443,7 +445,7 @@ class QASystem(object):
         # --------op1--------------
         g = self.attention.calculate(h, u, self.context_mask_placeholder, self.question_mask_placeholder, JX = self.JX, JQ = self.JQ, dropout = self.dropout_placeholder) # concat[h, u_a, h*u_a, h*h_a]
         d_com = d_en*4
-        assert g.get_shape().as_list() == [None, None, d_com], "Expected {}, got {}".format([None, JX, d_com], g.get_shape().as_list())
+        assert g.get_shape().as_list() == [None, None, d_com], "Expected {}, got {}".format([None, self.JX, d_com], g.get_shape().as_list())
 
         # Step 3:
         # 2 LSTM layers
