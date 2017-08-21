@@ -98,6 +98,9 @@ class Attention(object):
 
         #     use a_x to get u_a
         # Todo: why do matrix multiply in this way
+        # Reason: This is not a simple matmultiply...
+        # according to paper , sum(scalar * vector)
+        # so broadcasting and reduce
         a_x = tf.reshape(a_x, shape = [-1, JX, JQ, 1])
         u_aug = tf.reshape(u, shape = [-1, 1, JQ, d_en])
         u_a = tf.reduce_sum(tf.multiply(a_x, u_aug), axis = -2)# a_x * u: [N, JX, JQ](weight) * [N, JQ, d_en] -> [N, JX, d_en]
