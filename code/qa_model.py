@@ -4,15 +4,18 @@ from __future__ import print_function
 
 import time, datetime
 import logging
+import tensorflow as tf
+from tensorflow import vs
+import torch
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from tqdm import tqdm
 import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
-import tensorflow as tf
+from torch import nn
 from operator import mul
-from tensorflow.python.ops import variable_scope as vs
-from utils.util import ConfusionMatrix, Progbar, minibatches, one_hot, minibatch, get_best_span
+from .utils.util import ConfusionMatrix, Progbar, minibatches, one_hot, minibatch, get_best_span
 
-from evaluate import exact_match_score, f1_score
+from .evaluate import exact_match_score, f1_score
 
 logging.basicConfig(level=logging.INFO)
 
@@ -38,6 +41,16 @@ def get_optimizer(opt):
         assert (False)
     return optfn
 
+def get_optimizer_pytorch(opt):
+    if opt == "adam":
+        # TODO: add para
+        optfn = torch.optim.Adam()
+    elif opt == "sgd":
+        optfn = torch.optim.SGD()
+    else:
+        assert (False)
+    return optfn
+
 # With gradient clipping:
 def get_optimizer(opt, loss, max_grad_norm, learning_rate):
     if opt == "adam":
@@ -57,6 +70,26 @@ def get_optimizer(opt, loss, max_grad_norm, learning_rate):
 
     return train_op
 
+def get_optimizer_pytorch(opt, loss, max_grad_norm, learning_rate):
+    if opt == "adam":
+        optfn = torch.optim.Adam(lr=learning_rate)
+    elif opt == "sgd":
+        optfn = torch.optim.SGD(lr=learning_rate)
+    else:
+        assert (False)
+
+    grads_and_vars = optfn.compute_gradients(loss)
+    variables = [output[1] for output in grads_and_vars]
+    gradients = [output[0] for output in grads_and_vars]
+
+    # gradients = tf.clip_by_global_norm(gradients, clip_norm=max_grad_norm)[0]
+    # TODO: clip norm
+
+    grads_and_vars = [(gradients[i], variables[i]) for i in range(len(gradients))]
+    train_op = optfn.apply_gradients(grads_and_vars)
+
+    return train_op
+
 def softmax_mask_prepro(tensor, mask): # set huge neg number(-1e10) in padding area
     assert tensor.get_shape().ndims == mask.get_shape().ndims
     m0 = tf.subtract(tf.constant(1.0), tf.cast(mask, 'float32'))
@@ -64,9 +97,18 @@ def softmax_mask_prepro(tensor, mask): # set huge neg number(-1e10) in padding a
     tensor = tf.select(mask, tensor, paddings)
     return tensor
 
-class Attention(object):
+def softmax_mask_prepro_pytorch(tensor,mask):
+    # TODO: fix torch fun
+    assert tensor.get_shape().ndims == mask.get_shape().ndims
+    m0 = torch.subtract(torch.constant(1.0), torch.cast(mask, 'float32'))
+    paddings = torch.multiply(m0, torch.constant(-1e10))
+    tensor = torch.select(mask, tensor, paddings)
+    return tensor
+
+class Attention(nn.Module):
     def __init__(self):
-        pass
+        super(Attention,self).__init__()
+        self.softmax = nn.Softmax()
 
     def calculate(self, h, u, h_mask, u_mask, JX, JQ, dropout = 1.0):
         # compare the question representation with all the context hidden states.
@@ -124,6 +166,60 @@ class Attention(object):
         h_0_h_a = h*h_a #[None, JX, d_en]
         return tf.concat(2,[h, u_a, h_0_u_a, h_0_h_a])
 
+    def calculate_pytorch(self, h, u, h_mask, u_mask, JX, JQ, dropout = 1.0):
+        # compare the question representation with all the context hidden states.
+        #         e.g. S = h.T * u
+        #              a_x = softmax(S)
+        #              a_q = softmax(S.T)
+        #              u_a = sum(a_x*U)
+        #              h_a = sum(a_q*H)
+        """
+        :param h: [N, JX, d_en]
+        :param u: [N, JQ, d_en]
+        :param h_mask:  [N, JX]
+        :param u_mask:  [N, JQ]
+
+        :return: [N, JX, d_com]
+        """
+        d_en = h.get_shape().as_list()[-1]
+        # get similarity
+        h_aug = h.view(-1, JX, 1, d_en).expand(-1, -1, JQ, -1)
+        u_aug = u.view(-1, 1, JQ, d_en).expand(-1, JX, -1, -1)
+        h_mask_aug = h_mask.expand(-1, -1, JQ)
+        u_mask_aug = u_mask.expand(-1, JX, -1)
+
+        s = self.get_logits([h_aug, u_aug], None, True, is_train=(dropout < 1.0), func='tri_linear',
+                            input_keep_prob=dropout)  # [N, M, JX, JQ]
+
+        hu_mask_aug = h_mask_aug & u_mask_aug
+        s = softmax_mask_prepro(s, hu_mask_aug)
+
+        # get a_x
+        a_x = self.softmax(s)
+
+        #     use a_x to get u_a
+        a_x = a_x.view(-1, JX, JQ, 1)
+
+        u_aug = u.view(-1, 1, JQ, d_en)
+
+        u_a = torch.sum(a_x * u_aug, -2)
+
+        # get a_q
+        a_q = torch.max(s, -1)
+        a_q = self.softmax(a_q)
+        #     use a_q to get h_a
+        a_q = a_q.view(-1, JX, 1)
+
+        h_aug = h.view(-1, JX, d_en)
+
+        h_a = torch.sum(a_q * h_aug, -2)
+
+        h_a = h_a.expand(-1, JX, -1)
+
+        h_0_u_a = h * u_a  # [None, JX, d_en]
+        h_0_h_a = h * h_a  # [None, JX, d_en]
+        return torch.cat([h, u_a, h_0_u_a, h_0_h_a],2)
+
     # this function is from https://github.com/allenai/bi-att-flow/tree/master/my/tensorflow
     def get_logits(args, size, bias, bias_start=0.0, scope=None, mask=None, wd=0.0, input_keep_prob=1.0, is_train=None, func=None):
 
@@ -180,12 +276,21 @@ class Attention(object):
         return linear_logits([args[0], args[1], new_arg], bias, bias_start=bias_start, scope=scope, mask=mask, wd=wd, input_keep_prob=input_keep_prob,
                              is_train=is_train)
 
-class Encoder(object):
-    def __init__(self, vocab_dim, state_size, dropout = 0):
-        self.vocab_dim = vocab_dim
+    def get_logits_pytorch(self):
+        # TODO finish this function
+        pass
+
+    def forward(self, h, u, h_mask, u_mask, JX, JQ, dropout = 1.0):
+        return self.calculate_pytorch(h, u, h_mask, u_mask, JX, JQ, dropout = 1.0)
+
+class Encoder(nn.Module):
+    def __init__(self, input_size, state_size, dropout = 0):
+        super(Encoder,self).__init__()
+        self.input_size = input_size
         self.state_size = state_size
         #self.dropout = dropout
         #logging.info("Dropout rate for encoder: {}".format(self.dropout))
+        self.lstm = nn.LSTM(self.input_size,self.state_size,bidirectional=True,dropout=dropout)
 
     def encode(self, inputs, mask, encoder_state_input, dropout = 1.0):
         """
@@ -239,11 +344,28 @@ class Encoder(object):
         logging.debug('Concatenated bi-LSTM final hidden state: %s' % str(concat_final_state))
         return hidden_state, concat_final_state, (final_state_fw, final_state_bw)
 
+    def forward(self, inputs, mask, init_hidden_state, dropout = 1.0):
 
-class Decoder(object):
-    def __init__(self, output_size, state_size):
+        h_0 = None
+        c_0 = None
+        if init_hidden_state is not None:
+            h_0, c_0 = init_hidden_state
+
+        sequence_length = torch.sum(mask.int(), 1)
+        sequence_length = sequence_length.view(-1, )
+        packed = pack_padded_sequence(inputs, sequence_length)
+        outputs, hidden = self.lstm(packed, h_0,c_0)
+        outputs, output_lengths = pad_packed_sequence(outputs)
+
+        return outputs, hidden
+
+class Decoder(nn.Module):
+    def __init__(self, output_size, state_size,dropout):
+        super(Decoder,self).__init__()
         self.output_size = output_size
         self.state_size = state_size
+        self.lstm = nn.LSTM(input_size,state_size,bidirectional=True,dropout=dropout)
+        self.softmax = nn.Softmax()
 
     def decode(self, g, context_mask, JX, dropout = 1.0):
         """
@@ -281,6 +403,40 @@ class Decoder(object):
             e = self.get_logit(e_input, JX) #[N, JX]*2
 
         e = softmax_mask_prepro(e, context_mask)
+        return (s, e)
+
+    def decode_pytorch(self, g, context_mask, JX):
+        """
+        takes in a knowledge representation
+        and output a probability estimation over
+        all paragraph tokens on which token should be
+        the start of the answer span, and which should be
+        the end of the answer span.
+        m_2 = bi_LSTM*2(g)
+        """
+        d_de = self.state_size * 2
+        m, m_repr = \
+            self.decode_LSTM_pytorch(inputs=g, mask=context_mask, encoder_state_input=None)
+        m_2, m_2_repr = \
+            self.decode_LSTM_pytorch(inputs=m, mask=context_mask, encoder_state_input=None)
+
+        s = self.get_logit(m_2, JX)  # [N, JX]*2
+        # or s, e = self.get_logit_start_end(m_2) #[N, JX]*2
+        s = softmax_mask_prepro_pytorch(s, context_mask)
+
+        print(s.get_shape())
+
+        s_prob = self.softmax(s)
+
+        print(s_prob.get_shape())
+
+        # s_prob = tf.tile(tf.expand_dims(s_prob, 2), [1, 1, d_de])
+        s_prob = s_prob.expand(-1,-1,d_de)
+
+        e_input = torch.cat([m_2, m_2 * s_prob, s_prob],2)
+        e = self.get_logit(e_input, JX)  # [N, JX]*2
+
+        e = softmax_mask_prepro_pytorch(e, context_mask)
         return (s, e)
 
     def decode_LSTM(self, inputs, mask, encoder_state_input, dropout = 1.0, output_dropout = False):
@@ -324,6 +480,24 @@ class Decoder(object):
         logging.debug('Concatenated bi-LSTM final hidden state: %s' % str(concat_final_state))
         return hidden_state, concat_final_state, (final_state_fw, final_state_bw)
 
+    def decode_LSTM_pytorch(self, inputs, mask, encoder_state_input):
+
+        h_0 = None
+        c_0 = None
+        if encoder_state_input is not None:
+            h_0, c_0 = encoder_state_input
+
+        sequence_length = torch.sum(mask.int(),1)
+        sequence_length = tf.reshape(sequence_length, [-1, ])
+        sequence_length = sequence_length.view(-1,)
+        # Get lstm cell output
+
+        packed = pack_padded_sequence(inputs, sequence_length)
+        outputs, hidden = self.lstm(packed, h_0, c_0)
+        outputs, output_lengths = pad_packed_sequence(outputs)
+
+        return outputs, hidden
+
     def get_logit(self, X, JX):
         d = X.get_shape().as_list()[-1]
         assert X.get_shape().ndims == 3
@@ -351,7 +525,10 @@ class Decoder(object):
         pred2 = tf.matmul(pred2_1, W_se)+b_se
         return pred1, pred2
 
-class QASystem(object):
+    def forward(self, g, context_mask, JX):
+        return self.decode_pytorch(g, context_mask, JX)
+
+class QASystem(nn.Module):
     def __init__(self, pretrained_embeddings, config):
         """
         Initializes your System
@@ -360,30 +537,36 @@ class QASystem(object):
         :param decoder: a decoder that you constructed in train.py
         :param args: pass in more arguments as needed
         """
+        super(QASystem, self).__init__()
         self.pretrained_embeddings = pretrained_embeddings
-        self.encoder = Encoder(vocab_dim=config.embedding_size, state_size = config.encoder_state_size)
+        self.emb_layer = nn.Embedding(config.vocab_size, self.config.embedding_size)
+        self.q_encoder = Encoder(input_size=config.embedding_size, state_size = config.encoder_state_size)
+        self.c_encoder = Encoder(input_size=config.embedding_size, state_size = config.encoder_state_size)
+
         self.decoder = Decoder(output_size=config.output_size, state_size = config.decoder_state_size)
         self.attention = Attention()
         self.config = config
 
         # ==== set up placeholder tokens ====
-        self.question_placeholder = tf.placeholder(dtype=tf.int32, name="q", shape=(None, None))
-        self.question_mask_placeholder = tf.placeholder(dtype=tf.bool, name="q_mask", shape=(None, None))
-        self.context_placeholder = tf.placeholder(dtype=tf.int32, name="c", shape=(None, None))
-        self.context_mask_placeholder = tf.placeholder(dtype=tf.bool, name="c_mask", shape=(None, None))
-        # self.answer_placeholders = tf.placeholder(dtype=tf.int32, name="a", shape=(None, config.answer_size))
-        self.answer_start_placeholders = tf.placeholder(dtype=tf.int32, name="a_s", shape=(None,))
-        self.answer_end_placeholders = tf.placeholder(dtype=tf.int32, name="a_e", shape=(None,))
-        self.dropout_placeholder = tf.placeholder(dtype=tf.float32, name="dropout", shape=())
-        self.JX = tf.placeholder(dtype=tf.int32, name='JX', shape=())
-        self.JQ = tf.placeholder(dtype=tf.int32, name='JQ', shape=())
+        # self.question_placeholder = tf.placeholder(dtype=tf.int32, name="q", shape=(None, None))
+        # self.question_mask_placeholder = tf.placeholder(dtype=tf.bool, name="q_mask", shape=(None, None))
+        # self.context_placeholder = tf.placeholder(dtype=tf.int32, name="c", shape=(None, None))
+        # self.context_mask_placeholder = tf.placeholder(dtype=tf.bool, name="c_mask", shape=(None, None))
+        # # self.answer_placeholders = tf.placeholder(dtype=tf.int32, name="a", shape=(None, config.answer_size))
+        # self.answer_start_placeholders = tf.placeholder(dtype=tf.int32, name="a_s", shape=(None,))
+        # self.answer_end_placeholders = tf.placeholder(dtype=tf.int32, name="a_e", shape=(None,))
+        # self.dropout_placeholder = tf.placeholder(dtype=tf.float32, name="dropout", shape=())
+        # self.JX = tf.placeholder(dtype=tf.int32, name='JX', shape=())
+        # self.JQ = tf.placeholder(dtype=tf.int32, name='JQ', shape=())
 
 
         # ==== assemble pieces ====
-        with tf.variable_scope("qa", initializer=tf.uniform_unit_scaling_initializer(1.0)):
-            self.q, self.x = self.setup_embeddings()
-            self.preds = self.setup_system(self.x, self.q)
-            self.loss = self.setup_loss(self.preds)
+        # with tf.variable_scope("qa", initializer=tf.uniform_unit_scaling_initializer(1.0)):
+        #     self.q, self.x = self.setup_embeddings()
+        #     self.preds = self.setup_system(self.x, self.q)
+        #     self.loss = self.setup_loss(self.preds)
+
+
 
         # ==== set up training/updating procedure ====
         # No gradient clipping:
@@ -397,7 +580,16 @@ class QASystem(object):
             self.train_op = self.build_ema(opt_op)
         else:
             self.train_op = opt_op
-        self.merged = tf.summary.merge_all()
+        # TODO : tensorboard
+        # self.merged = tf.summary.merge_all()
+
+    def forward(self, q,c,c_mask,q_mask):
+        q, c = self.setup_embeddings_pytorch(q,c)
+        preds = self.setup_system_pytorch(c, q,c_mask,q_mask)
+        # todo: loss should be calculated in trainer module
+        # loss = self.setup_loss_pytorch(self.preds)
+
+        return preds
 
     def build_ema(self, opt_op):
         self.ema = tf.train.ExponentialMovingAverage(self.config.ema_weight_decay)
@@ -451,6 +643,45 @@ class QASystem(object):
         pred1, pred2 = self.decoder.decode(g, self.context_mask_placeholder, dropout = self.dropout_placeholder, JX = self.JX)
         return pred1, pred2
 
+    def setup_system_pytorch(self, c, q,c_mask,q_mask):
+        d = c.get_shape().as_list()[-1]  # self.config.embedding_size
+        #   x: [None, JX, d]
+        #   q: [None, JQ, d]
+
+        # Step 1: encode x and q, respectively, with independent weights
+        #         e.g. u = encode_question(q)  # get U (2d*J) as representation of q
+        #         e.g. h = encode_context(x, u_state)   # get H (2d*T) as representation of x
+
+        u, question_repr = \
+            self.q_encoder(inputs=q, mask=q_mask, encoder_state_input=None,
+                           dropout=self.config.dropout)
+        if self.config.QA_ENCODER_SHARE:
+            h, context_repr = \
+                self.c_encoder(inputs=c, mask=c_mask, encoder_state_input=None,
+                                    dropout=self.config.dropout)
+        if not self.config.QA_ENCODER_SHARE:
+            h, context_repr = \
+                self.c_encoder(inputs=c, mask=c_mask, encoder_state_input=None,
+                                    dropout=self.config.dropout)
+            # self.encoder.encode(inputs=x, mask=self.context_mask_placeholder, encoder_state_input=None)
+
+        # Step 2: combine H and U using "Attention"
+        #         e.g. s = h.T * u
+        #              a_x = softmax(s)
+        #              a_q = softmax(s.T)
+        #              u_hat = sum(a_x*u)
+        #              h_hat = sum(a_q*h)
+        #              g = combine(u, h, u_hat, h_hat)
+        # --------op1--------------
+        g = self.attention(h, u, c_mask, q_mask, JX=self.JX,
+                                     JQ=self.JQ, dropout=self.config.dropout)  # concat[h, u_a, h*u_a, h*h_a]
+
+        # Step 3:
+        # 2 LSTM layers
+        # logistic regressions
+        pred1, pred2 = self.decoder(g, c_mask, JX=self.JX)
+        return pred1, pred2
+
     def setup_loss(self, preds):
         with vs.variable_scope("loss"):
             s, e = preds # [None, JX]*2
@@ -462,6 +693,17 @@ class QASystem(object):
             # loss2 = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=e, labels=self.answer_end_placeholders),)
         loss = loss1 + loss2
         tf.summary.scalar('loss', loss)
+        return loss
+
+    def setup_loss_pytorch(self,preds):
+        s, e = preds  # [None, JX]*2
+        # loss1 = tf.reduce_sum(tf.nn.sparse_softmax_cross_entropy_with_logits(logits=s, labels=self.answer_start_placeholders),)
+        # loss2 = tf.reduce_sum(tf.nn.sparse_softmax_cross_entropy_with_logits(logits=e, labels=self.answer_end_placeholders),)
+        # TODO: get NLL loss
+        loss1 = torch.sum()
+        loss2 = torch.sum()
+        loss = loss1 + loss2
+        # TODO: add loss to tf-board to visualize
         return loss
 
     def setup_embeddings(self):
@@ -478,6 +720,19 @@ class QASystem(object):
             context_embeddings = tf.reshape(context_embeddings, shape = [-1, self.JX, self.config.embedding_size])
 
         return question_embeddings, context_embeddings
+
+    def setup_embeddings_pytorch(self,q,c):
+        if not self.config.RE_TRAIN_EMBED:
+            self.emb_layer.weight = nn.Parameter(torch.from_numpy(self.pretrained_embeddings))
+            self.emb_layer.weight.requires_grad = False
+
+        q_emb = self.emb_layer(q).float()
+        q_emb = q_emb.view(-1, self.JQ, self.config.embedding_size)
+
+        c_emb = self.emb_layer(c).float()
+        c_emb = c_emb.view(-1, self.JX, self.config.embedding_size)
+
+        return q_emb, c_emb
 
     def create_feed_dict(self, question_batch, question_len_batch, context_batch, context_len_batch, JX=10, JQ=10, answer_batch=None, is_train = True):
         feed_dict = {}
@@ -671,19 +926,21 @@ class QASystem(object):
         return avg_loss
 
 
-    def train(self, session, dataset, train_dir, vocab):
+    def train(self, dataset, train_dir, vocab):
         tic = time.time()
-        params = tf.trainable_variables()
-        num_params = sum(map(lambda t: np.prod(tf.shape(t.value()).eval()), params))
-        toc = time.time()
-        logging.info("Number of params: %d (retreival took %f secs)" % (num_params, toc - tic))
+        # TODO:pytorch get trainable paras
+        # params = tf.trainable_variables()
+        # num_params = sum(map(lambda t: np.prod(tf.shape(t.value()).eval()), params))
+        # toc = time.time()
+        # logging.info("Number of params: %d (retreival took %f secs)" % (num_params, toc - tic))
 
         training_set = dataset['training'] # [question, len(question), context, len(context), answer]
         validation_set = dataset['validation']
         f1_best = 0
-        if self.config.tensorboard:
-            train_writer_dir = self.config.log_dir + '/train/' # + datetime.datetime.now().strftime('%m-%d_%H-%M-%S')
-            self.train_writer = tf.summary.FileWriter(train_writer_dir, session.graph)
+        # TODO: finish tensorboard in pytorch
+        # if self.config.tensorboard:
+        #     train_writer_dir = self.config.log_dir + '/train/' # + datetime.datetime.now().strftime('%m-%d_%H-%M-%S')
+        #     self.train_writer = tf.summary.FileWriter(train_writer_dir, session.graph)
         for epoch in range(self.config.epochs):
             logging.info("="* 10 + " Epoch %d out of %d " + "="* 10, epoch + 1, self.config.epochs)
 
