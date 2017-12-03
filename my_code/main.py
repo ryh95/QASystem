@@ -7,14 +7,20 @@ import json
 
 import torch
 
-from .config import parse_args
-from .qa_model import Encoder, QASystem, Decoder
+# from config import parse_args
+# from .qa_model import Encoder, QASystem, Decoder
+
 from os.path import join as pjoin
 from os.path import exists as pexists
 
-from .utils.data_reader import read_data, load_glove_embeddings
+# from .utils.data_reader import read_data, load_glove_embeddings
 
 import logging
+
+from config import parse_args
+# from my_code.qa_model import QASystem
+from my_code.model import QASystem
+from my_code.utils.data_reader import read_data, load_glove_embeddings
 
 logging.basicConfig(level=logging.INFO)
 
@@ -68,47 +74,41 @@ def get_normalized_train_dir(train_dir):
     #os.symlink(os.path.abspath(train_dir), global_train_dir)
     return global_train_dir
 
-
-def main():
-
-
-    #dataset = read_data(FLAGS.data_dir, small_dir=None, small_val=None, \
+if __name__ == "__main__":
+    # dataset = read_data(FLAGS.data_dir, small_dir=None, small_val=None, \
     #    debug_train_samples=FLAGS.debug_train_samples, debug_val_samples=100, context_maxlen=FLAGS.context_maxlen)
     args = parse_args()
-    dataset = read_data(args.data_dir)
-    if args.context_maxlen is None:
-        args.context_maxlen = dataset['context_maxlen']
-    if args.question_maxlen is None:
-        args.question_maxlen = dataset['question_maxlen']
-
-    embed_path = args.embed_path or pjoin("data", "squad", "glove.trimmed.{}.npz".format(args.embedding_size))
+    dataset = read_data(args)
+    # if args.context_maxlen is None:
+    #     args.context_maxlen = dataset['context_maxlen']
+    # if args.question_maxlen is None:
+    #     args.question_maxlen = dataset['question_maxlen']
+    #
+    embed_path = args.embed_path or pjoin(args.data_dir, "glove.trimmed.{}.npz".format(args.embedding_size))
     embeddings = load_glove_embeddings(embed_path)
-
+    #
     vocab_path = args.vocab_path or pjoin(args.data_dir, "vocab.dat")
     vocab, rev_vocab = initialize_vocab(vocab_path)
     args.vocab_size = len(vocab)
 
     qa = QASystem(embeddings, args)
-
-    if not os.path.exists(args.log_dir):
-        os.makedirs(args.log_dir)
-    file_handler = logging.FileHandler(pjoin(args.log_dir, "log.txt"))
-    logging.getLogger().addHandler(file_handler)
-
-    print(vars(args))
-    with open(os.path.join(args.log_dir, "flags.json"), 'w') as fout:
-        json.dump(args.__flags, fout)
-
-    gpu_options = torch.cuda.is_available()
-    #gpu_options.allow_growth=True
-
-    # with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
-    load_train_dir = get_normalized_train_dir(args.load_train_dir or args.train_dir)
-    initialize_model(qa, load_train_dir)
-
-    save_train_dir = get_normalized_train_dir(args.train_dir)
-    qa.train(dataset, save_train_dir, rev_vocab)
-
-
-if __name__ == "__main__":
-    main()
+    print('model initialized!')
+    #
+    # if not os.path.exists(args.log_dir):
+    #     os.makedirs(args.log_dir)
+    # file_handler = logging.FileHandler(pjoin(args.log_dir, "log.txt"))
+    # logging.getLogger().addHandler(file_handler)
+    #
+    # print(vars(args))
+    # with open(os.path.join(args.log_dir, "flags.json"), 'w') as fout:
+    #     json.dump(args.__flags, fout)
+    #
+    # gpu_options = torch.cuda.is_available()
+    # # gpu_options.allow_growth=True
+    #
+    # # with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
+    # load_train_dir = get_normalized_train_dir(args.load_train_dir or args.train_dir)
+    # initialize_model(qa, load_train_dir)
+    #
+    # save_train_dir = get_normalized_train_dir(args.train_dir)
+    # # qa.train(dataset, save_train_dir, rev_vocab)
