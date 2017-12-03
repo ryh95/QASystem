@@ -1,8 +1,14 @@
 import numpy as np
+import time
 from tqdm import tqdm
+import logging
 import torch
 from torch.autograd import Variable as Var
 # from utils import map_label_to_target
+from my_code.analyze_answer import f1_score, exact_match_score
+from my_code.utils.util import Progbar, minibatches, get_best_span
+
+logging.basicConfig(level=logging.INFO)
 
 class Trainer(object):
     def __init__(self, args, model, criterion, optimizer):
@@ -14,13 +20,15 @@ class Trainer(object):
         self.epoch      = 0
 
     # helper function for training
-    def train(self, dataset, train_dir, vocab):
-        # tic = time.time()
+    def train(self, dataset,vocab):
+        tic = time.time()
         # TODO:pytorch get trainable paras
         # params = tf.trainable_variables()
         # num_params = sum(map(lambda t: np.prod(tf.shape(t.value()).eval()), params))
-        # toc = time.time()
-        # logging.info("Number of params: %d (retreival took %f secs)" % (num_params, toc - tic))
+        num_params = self.model.parameters()
+        toc = time.time()
+
+        logging.info("Number of params: %d (retreival took %f secs)" % (num_params, toc - tic))
 
         training_set = dataset['training']  # [question, len(question), context, len(context), answer]
         validation_set = dataset['validation']
@@ -29,31 +37,28 @@ class Trainer(object):
         # if self.config.tensorboard:
         #     train_writer_dir = self.config.log_dir + '/train/' # + datetime.datetime.now().strftime('%m-%d_%H-%M-%S')
         #     self.train_writer = tf.summary.FileWriter(train_writer_dir, session.graph)
-        # for epoch in range(self.config.epochs):
-            # logging.info("=" * 10 + " Epoch %d out of %d " + "=" * 10, epoch + 1, self.config.epochs)
+
+        for epoch in range(self.args.epochs):
+            logging.info("=" * 10 + " Epoch %d out of %d " + "=" * 10, epoch + 1, self.args.epochs)
 
             # TODO run training
-            # score = self.run_epoch(session, epoch, training_set, vocab, validation_set,
-            #                        sample_size=self.config.evaluate_sample_size)
-            # logging.info("-- validation --")
+            score = self.run_epoch(epoch, training_set, vocab, validation_set,
+                                   sample_size=self.args.evaluate_sample_size)
+            logging.info("-- validation --")
             # TODO validate answer
-            # self.validate(session, validation_set)
+            val_loss = self.validate(validation_set)
 
             # TODO get f1 and em
-            # f1, em = self.evaluate_answer(session, validation_set, vocab,
-            #                               sample=self.config.model_selection_sample_size, log=True)
+            f1, em = self.evaluate_answer(validation_set, vocab,
+                                          sample=self.args.model_selection_sample_size, log=True)
 
             # TODO Saving the model
-            # if f1 > f1_best:
-            #     f1_best = f1
-            #     saver = tf.train.Saver()
-            #     # TODO torch save model
-            #     # saver.save(session, train_dir + '/fancier_model')
-            #     logging.info('New best f1 in val set')
-            #     logging.info('')
-            # saver = tf.train.Saver()
-            # TODO torch save model
-            # saver.save(session, train_dir + '/fancier_model_' + str(epoch))
+            if f1 > f1_best:
+                checkpoint = {'model': self.model.state_dict(), 'optim': self.optimizer,
+                              'args': self.args, 'epoch': epoch}
+                torch.save(checkpoint, '%s.pt' % self.args.check_path)
+                logging.info('New best f1 in val set')
+                logging.info('')
 
     # helper function for testing
     # def test(self, dataset):
@@ -104,56 +109,72 @@ class Trainer(object):
         question, question_mask = padding_batch(question_batch, JQ)
         context, context_mask = padding_batch(context_batch, JX)
 
-        data_dict['question_placeholder'] = question
-        data_dict['question_mask_placeholder'] = question_mask
-        data_dict['context_placeholder'] = context
-        data_dict['context_mask_placeholder'] = context_mask
+        data_dict['q'] = question
+        data_dict['q_mask'] = question_mask
+        data_dict['c'] = context
+        data_dict['c_mask'] = context_mask
         data_dict['JQ'] = JQ
         data_dict['JX'] = JX
 
         if answer_batch is not None:
             start = answer_batch[:,0]
             end = answer_batch[:,1]
-            data_dict['answer_start_placeholders'] = start
-            data_dict['answer_end_placeholders'] = end
+            data_dict['ans_start'] = start
+            data_dict['ans_end'] = end
         if is_train:
-            data_dict['dropout_placeholder'] = 0.8
+            data_dict['dropout'] = 0.8
         else:
-            data_dict['dropout_placeholder'] = 1.0
+            data_dict['dropout'] = 1.0
 
         return data_dict
 
-    def run_epoch(self, session, epoch_num, training_set, vocab, validation_set, sample_size=400):
+    def run_epoch(self, epoch_num, training_set, vocab, validation_set, sample_size=400):
         set_num = len(training_set)
-        batch_size = self.config.batch_size
+        batch_size = self.args.batch_size
         batch_num = int(np.ceil(set_num * 1.0 / batch_size))
         sample_size = 400
 
         prog = Progbar(target=batch_num)
         avg_loss = 0
-        for i, batch in enumerate(minibatches(training_set, self.config.batch_size, window_batch = self.config.window_batch)):
+        self.model.train()
+        self.optimizer.zero_grad()
+        for i, batch in enumerate(minibatches(training_set, self.args.batch_size, window_batch = self.args.window_batch)):
             global_batch_num = batch_num * epoch_num + i
-            _, summary, loss = self.optimize(session, batch)
+
+            question_batch, question_len_batch, context_batch, context_len_batch, answer_batch = training_set
+            data_dict = self.create_feed_dict(question_batch, question_len_batch, context_batch, context_len_batch,
+                                               answer_batch=answer_batch, is_train=True)
+
+            preds = self.model(data_dict['q'],data_dict['c'],data_dict['c_mask'],data_dict['q_mask'])
+
+            loss = self.criterion(preds,(data_dict['ans_start'],data_dict['ans_end']))
+            loss.backward()
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
             prog.update(i + 1, [("training loss", loss)])
-            if self.config.tensorboard and global_batch_num % self.config.log_batch_num == 0:
-                self.train_writer.add_summary(summary, global_batch_num)
-            if (i+1) % self.config.log_batch_num == 0:
+            # TODO tensorboard
+            # if self.config.tensorboard and global_batch_num % self.config.log_batch_num == 0:
+            #     self.train_writer.add_summary(summary, global_batch_num)
+
+            if (i+1) % self.args.log_batch_num == 0:
                 logging.info('')
-                self.evaluate_answer(session, training_set, vocab, sample=sample_size, log=True)
-                self.evaluate_answer(session, validation_set, vocab, sample=sample_size, log=True)
-            avg_loss += loss
+                # TODO check evaluate_answer
+                self.evaluate_answer(training_set, vocab, sample=sample_size, log=True)
+                self.evaluate_answer(validation_set, vocab, sample=sample_size, log=True)
+            avg_loss += loss.data[0]
         avg_loss /= batch_num
         logging.info("Average training loss: {}".format(avg_loss))
         return avg_loss
 
-    def evaluate_answer(self, session, dataset, vocab, sample=400, log=False):
+    def evaluate_answer(self, dataset, vocab, sample=400, log=False):
         f1 = 0.
         em = 0.
 
         N = len(dataset)
         sampleIndices = np.random.choice(N, sample, replace=False)
         evaluate_set = [dataset[i] for i in sampleIndices]
-        predicts = self.predict_on_batch(session, evaluate_set)
+        predicts = self.predict_on_batch(evaluate_set)
 
         for example, (start, end) in zip(evaluate_set, predicts):
             q, _, c, _, (true_s, true_e) = example
@@ -177,20 +198,24 @@ class Trainer(object):
 
         return f1, em
 
-    def test(self, session, validation_set):
+    def test(self, validation_set):
         """
         in here you should compute a cost for your validation set
         and tune your hyperparameters according to the validation set performance
         :return:
         """
         question_batch, question_len_batch, context_batch, context_len_batch, answer_batch = validation_set
-        input_feed = self.create_feed_dict(question_batch, question_len_batch, context_batch, context_len_batch, answer_batch=answer_batch, is_train = False)
+        data_dict = self.create_feed_dict(question_batch, question_len_batch, context_batch, context_len_batch, answer_batch=answer_batch, is_train = False)
 
-        output_feed = [self.loss]
-        outputs = session.run(output_feed, input_feed)
-        return outputs
+        # output_feed = [self.loss]
+        # outputs = session.run(output_feed, input_feed)
+        preds = self.model(data_dict['q'], data_dict['c'], data_dict['c_mask'], data_dict['q_mask'])
 
-    def answer(self, session, test_batch):
+        loss = self.criterion(preds, (data_dict['ans_start'], data_dict['ans_end']))
+
+        return loss
+
+    def answer(self, test_batch):
         """
         Returns the probability distribution over different positions in the paragraph
         so that other methods like self.answer() will be able to work properly
@@ -201,36 +226,26 @@ class Trainer(object):
         # input_feed['test_x'] = test_x
 
         question_batch, question_len_batch, context_batch, context_len_batch, answer_batch = test_batch
-        input_feed =  self.create_feed_dict(question_batch, question_len_batch, context_batch, context_len_batch, answer_batch=None, is_train = False)
-        output_feed = [self.preds[0], self.preds[1]]
-        outputs = session.run(output_feed, input_feed)
+        data_dict =  self.create_feed_dict(question_batch, question_len_batch, context_batch, context_len_batch, answer_batch=None, is_train = False)
+        # outputs = session.run(output_feed, input_feed)
+        preds = self.model(data_dict['q'], data_dict['c'], data_dict['c_mask'], data_dict['q_mask'])
 
-        s, e = outputs
+        s, e = preds
 
         best_spans, scores = zip(*[get_best_span(si, ei, ci) for si, ei, ci in zip(s, e, context_batch)])
         return best_spans
 
-    def predict_on_batch(self, session, dataset):
-        batch_num = int(np.ceil(len(dataset) * 1.0 / self.config.batch_size))
+    def predict_on_batch(self, dataset):
+        batch_num = int(np.ceil(len(dataset) * 1.0 / self.args.batch_size))
         # prog = Progbar(target=batch_num)
         predicts = []
-        for i, batch in tqdm(enumerate(minibatches(dataset, self.config.batch_size, shuffle=False))):
-            pred = self.answer(session, batch)
+        for i, batch in tqdm(enumerate(minibatches(dataset, self.args.batch_size, shuffle=False))):
+            pred = self.answer(batch)
             # prog.update(i + 1)
             predicts.extend(pred)
         return predicts
 
-    def predict_on_batch(self, session, dataset):
-        batch_num = int(np.ceil(len(dataset) * 1.0 / self.config.batch_size))
-        # prog = Progbar(target=batch_num)
-        predicts = []
-        for i, batch in tqdm(enumerate(minibatches(dataset, self.config.batch_size, shuffle=False))):
-            pred = self.answer(session, batch)
-            # prog.update(i + 1)
-            predicts.extend(pred)
-        return predicts
-
-    def validate(self, sess, valid_dataset):
+    def validate(self, valid_dataset):
         """
         Iterate through the validation dataset and determine what
         the validation cost is.
@@ -242,30 +257,16 @@ class Trainer(object):
 
         :return:
         """
-        batch_num = int(np.ceil(len(valid_dataset) * 1.0 / self.config.batch_size))
+        batch_num = int(np.ceil(len(valid_dataset) * 1.0 / self.args.batch_size))
         prog = Progbar(target=batch_num)
         avg_loss = 0
-        for i, batch in enumerate(minibatches(valid_dataset, self.config.batch_size)):
-            loss = self.test(sess, batch)[0]
+        for i, batch in enumerate(minibatches(valid_dataset, self.args.batch_size)):
+            loss = self.test(batch)[0]
             prog.update(i + 1, [("validation loss", loss)])
             avg_loss += loss
         avg_loss /= batch_num
         logging.info("Average validation loss: {}".format(avg_loss))
         return avg_loss
-
-    def optimize(self, session, training_set):
-        """
-        Takes in actual data to optimize your model
-        This method is equivalent to a step() function
-        :return:
-        """
-        question_batch, question_len_batch, context_batch, context_len_batch, answer_batch = training_set
-        input_feed = self.create_feed_dict(question_batch, question_len_batch, context_batch, context_len_batch, answer_batch=answer_batch, is_train = True)
-
-        output_feed = [self.train_op, self.merged, self.loss]
-
-        outputs = session.run(output_feed, input_feed)
-        return outputs
 
     def setup_loss(self, preds):
         with vs.variable_scope("loss"):
@@ -290,16 +291,6 @@ class Trainer(object):
         loss = loss1 + loss2
         # TODO: add loss to tf-board to visualize
         return loss
-
-    def get_optimizer_pytorch(opt):
-        if opt == "adam":
-            # TODO: add para
-            optfn = torch.optim.Adam()
-        elif opt == "sgd":
-            optfn = torch.optim.SGD()
-        else:
-            assert (False)
-        return optfn
 
     # with gradient clipping
     def get_optimizer_pytorch(opt, loss, max_grad_norm, learning_rate):

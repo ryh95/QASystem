@@ -6,7 +6,8 @@ import os
 import json
 
 import torch
-
+from torch import nn
+from torch import optim
 # from config import parse_args
 # from .qa_model import Encoder, QASystem, Decoder
 
@@ -20,12 +21,13 @@ import logging
 from config import parse_args
 # from my_code.qa_model import QASystem
 from my_code.model import QASystem
+from my_code.trainer import Trainer
 from my_code.utils.data_reader import read_data, load_glove_embeddings
 
 logging.basicConfig(level=logging.INFO)
 
 
-def initialize_model(session, model, train_dir):
+def initialize_model( model, train_dir):
     # ckpt = tf.train.get_checkpoint_state(train_dir)
     ckpt = torch.load(train_dir)
     v2_path = ckpt.model_checkpoint_path + ".index" if ckpt else ""
@@ -40,6 +42,8 @@ def initialize_model(session, model, train_dir):
         # session.run(tf.global_variables_initializer())
         # logging.info('Num params: %d' % sum(v.get_shape().num_elements() for v in tf.trainable_variables()))
         # TODO: how to calculate num parameters in a model?
+        for para in model.parameters():
+            print(para)
     return model
 
 
@@ -107,8 +111,18 @@ if __name__ == "__main__":
     # # gpu_options.allow_growth=True
     #
     # # with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
-    # load_train_dir = get_normalized_train_dir(args.load_train_dir or args.train_dir)
-    # initialize_model(qa, load_train_dir)
+    load_train_dir = get_normalized_train_dir(args.load_train_dir or args.train_dir)
+    initialize_model(qa, load_train_dir)
     #
-    # save_train_dir = get_normalized_train_dir(args.train_dir)
-    # # qa.train(dataset, save_train_dir, rev_vocab)
+    save_train_dir = get_normalized_train_dir(args.train_dir)
+    # qa.train(dataset, save_train_dir, rev_vocab)
+    criterion = nn.NLLLoss()
+    if args.optimizer=='adam':
+        optimizer   = optim.Adam(qa.parameters(), lr=args.lr, weight_decay=args.wd)
+    elif args.optimizer=='adagrad':
+        optimizer   = optim.Adagrad(qa.parameters(), lr=args.lr, weight_decay=args.wd)
+    elif args.optimizer=='sgd':
+        optimizer   = optim.SGD(qa.parameters(), lr=args.lr, weight_decay=args.wd)
+
+    trainer = Trainer(args, qa, criterion, optimizer)
+    trainer.train(dataset,vocab)
