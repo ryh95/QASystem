@@ -27,23 +27,25 @@ from my_code.utils.data_reader import read_data, load_glove_embeddings
 logging.basicConfig(level=logging.INFO)
 
 
-def initialize_model( model, train_dir):
+def initialize_model(model, ckpt_dir):
     # ckpt = tf.train.get_checkpoint_state(train_dir)
-    ckpt = torch.load(train_dir)
-    v2_path = ckpt.model_checkpoint_path + ".index" if ckpt else ""
-    if ckpt and (pexists(ckpt.model_checkpoint_path) or pexists(v2_path)):
+    if pexists(ckpt_dir):
+        ckpt = torch.load(ckpt_dir)
         logging.info("Reading model parameters from %s" % ckpt.model_checkpoint_path)
         # saver = tf.train.Saver()
         # saver.restore(session, ckpt.model_checkpoint_path)
         # TODO: load model
-
     else:
         logging.info("Created model with fresh parameters.")
         # session.run(tf.global_variables_initializer())
         # logging.info('Num params: %d' % sum(v.get_shape().num_elements() for v in tf.trainable_variables()))
+        logging.info("Print model")
         # TODO: how to calculate num parameters in a model?
+        logging.info(model)
+        all_paras = 0
         for para in model.parameters():
-            print(para)
+            all_paras += torch.numel(para.data)
+        logging.info("Num paras: {}".format(all_paras))
     return model
 
 
@@ -60,24 +62,6 @@ def initialize_vocab(vocab_path):
         raise ValueError("Vocabulary file %s not found.", vocab_path)
 
 
-def get_normalized_train_dir(train_dir):
-    """
-    Adds symlink to {train_dir} from /tmp/cs224n-squad-train to canonicalize the
-    file paths saved in the checkpoint. This allows the model to be reloaded even
-    if the location of the checkpoint files has moved, allowing usage with CodaLab.
-    This must be done on both train.py and qa_answer.py in order to work.
-    """
-    global_train_dir = train_dir
-    #global_train_dir = '/tmp/cs224n-squad-train'
-    #if os.path.exists(global_train_dir):
-    #    os.unlink(global_train_dir)
-    if not pexists(train_dir):
-        os.makedirs(train_dir)
-    #print('source: ',os.path.abspath(train_dir))
-    #print('dst: ', global_train_dir)
-    #os.symlink(os.path.abspath(train_dir), global_train_dir)
-    return global_train_dir
-
 if __name__ == "__main__":
     # dataset = read_data(FLAGS.data_dir, small_dir=None, small_val=None, \
     #    debug_train_samples=FLAGS.debug_train_samples, debug_val_samples=100, context_maxlen=FLAGS.context_maxlen)
@@ -89,7 +73,8 @@ if __name__ == "__main__":
     #     args.question_maxlen = dataset['question_maxlen']
     #
     embed_path = args.embed_path or pjoin(args.data_dir, "glove.trimmed.{}.npz".format(args.embedding_size))
-    embeddings = load_glove_embeddings(embed_path)
+    # embeddings = load_glove_embeddings(embed_path)
+    embeddings = None
     #
     vocab_path = args.vocab_path or pjoin(args.data_dir, "vocab.dat")
     vocab, rev_vocab = initialize_vocab(vocab_path)
@@ -111,18 +96,16 @@ if __name__ == "__main__":
     # # gpu_options.allow_growth=True
     #
     # # with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
-    load_train_dir = get_normalized_train_dir(args.load_train_dir or args.train_dir)
-    initialize_model(qa, load_train_dir)
+    qa = initialize_model(qa, args.ckpt_dir)
     #
-    save_train_dir = get_normalized_train_dir(args.train_dir)
     # qa.train(dataset, save_train_dir, rev_vocab)
     criterion = nn.NLLLoss()
     if args.optimizer=='adam':
-        optimizer   = optim.Adam(qa.parameters(), lr=args.lr, weight_decay=args.wd)
+        optimizer   = optim.Adam(qa.parameters(), lr=args.lr)
     elif args.optimizer=='adagrad':
-        optimizer   = optim.Adagrad(qa.parameters(), lr=args.lr, weight_decay=args.wd)
+        optimizer   = optim.Adagrad(qa.parameters(), lr=args.lr)
     elif args.optimizer=='sgd':
-        optimizer   = optim.SGD(qa.parameters(), lr=args.lr, weight_decay=args.wd)
+        optimizer   = optim.SGD(qa.parameters(), lr=args.lr)
 
     trainer = Trainer(args, qa, criterion, optimizer)
     trainer.train(dataset,vocab)

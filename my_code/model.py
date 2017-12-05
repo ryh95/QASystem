@@ -4,18 +4,16 @@ from __future__ import print_function
 
 import time, datetime
 import logging
-# import tensorflow as tf
-# from tensorflow import vs
 import torch
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from torch.autograd import Variable as Var
 from tqdm import tqdm
 import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
 from torch import nn
-from operator import mul
+from operator import mul, itemgetter
 from .utils.util import ConfusionMatrix, Progbar, minibatches, one_hot, minibatch, get_best_span
 
-from .evaluate import exact_match_score, f1_score
 
 logging.basicConfig(level=logging.INFO)
 
@@ -68,17 +66,18 @@ logging.basicConfig(level=logging.INFO)
 #     return tensor
 
 def softmax_mask_prepro_pytorch(tensor,mask):
-    # TODO: fix torch fun
-    assert tensor.get_shape().ndims == mask.get_shape().ndims
-    m0 = torch.subtract(torch.constant(1.0), torch.cast(mask, 'float32'))
-    paddings = torch.multiply(m0, torch.constant(-1e10))
-    tensor = torch.select(mask, tensor, paddings)
+    m0 = mask - 1.0
+    paddings = m0 * (1e10)
+    # TODO use plus instead of select may have bugs, if then need to fix after
+    # tensor = torch.select(mask, tensor, paddings)
+    tensor += paddings
     return tensor
 
 class Attention(nn.Module):
-    def __init__(self):
+    def __init__(self,config):
         super(Attention,self).__init__()
         self.softmax = nn.Softmax()
+        self.config = config
 
     # def calculate(self, h, u, h_mask, u_mask, JX, JQ, dropout = 1.0):
         # compare the question representation with all the context hidden states.
@@ -136,7 +135,7 @@ class Attention(nn.Module):
         # h_0_h_a = h*h_a #[None, JX, d_en]
         # return tf.concat(2,[h, u_a, h_0_u_a, h_0_h_a])
 
-    def calculate_pytorch(self, h, u, h_mask, u_mask, JX, JQ, dropout = 1.0):
+    def calculate_pytorch(self, h, u, h_mask, u_mask, JX, JQ):
         # compare the question representation with all the context hidden states.
         #         e.g. S = h.T * u
         #              a_x = softmax(S)
@@ -151,44 +150,48 @@ class Attention(nn.Module):
 
         :return: [N, JX, d_com]
         """
-        d_en = h.get_shape().as_list()[-1]
-        # get similarity
-        h_aug = h.view(-1, JX, 1, d_en).expand(-1, -1, JQ, -1)
-        u_aug = u.view(-1, 1, JQ, d_en).expand(-1, JX, -1, -1)
+        # d_en = h.get_shape().as_list()[-1]
+        # # get similarity
+        # h_aug = h.view(-1, JX, 1, d_en).expand(-1, -1, JQ, -1)
+        # u_aug = u.view(-1, 1, JQ, d_en).expand(-1, JX, -1, -1)
         h_mask_aug = h_mask.expand(-1, -1, JQ)
         u_mask_aug = u_mask.expand(-1, JX, -1)
-
-        s = self.get_logits([h_aug, u_aug], None, True, is_train=(dropout < 1.0), func='tri_linear',
-                            input_keep_prob=dropout)  # [N, M, JX, JQ]
-
         hu_mask_aug = h_mask_aug & u_mask_aug
+
+        # TODO : first use vanilla cos similarity, then can use some NN like the Bidaf paper
+        # s = self.get_logits([h_aug, u_aug], None, True, is_train=(dropout < 1.0), func='tri_linear',
+        #                     input_keep_prob=dropout)  # [N, M, JX, JQ]
+
+        s = torch.bmm(h,torch.transpose(u,1,2))
+
         s = softmax_mask_prepro_pytorch(s, hu_mask_aug)
 
         # get a_x
+        # should be row softmax
         a_x = self.softmax(s)
 
-        #     use a_x to get u_a
-        a_x = a_x.view(-1, JX, JQ, 1)
+        # use a_x to get u_a
+        if self.config.encoder_bidirectional == True:
+            d_en = 2*self.config.encoder_state_size
+        else:
+            d_en = self.config.encoder_state_size
 
-        u_aug = u.view(-1, 1, JQ, d_en)
+        a_x = a_x.expand(-1, JX, JQ, d_en)
 
-        u_a = torch.sum(a_x * u_aug, -2)
+        u_aug = u.expand(-1, JX, JQ, d_en)
+
+        u_hat = torch.sum(a_x * u_aug, 1)
 
         # get a_q
-        a_q = torch.max(s, -1)
+        a_q = torch.max(s, -1,keep_dim=True)
         a_q = self.softmax(a_q)
         #     use a_q to get h_a
-        a_q = a_q.view(-1, JX, 1)
 
-        h_aug = h.view(-1, JX, d_en)
+        h_hat = a_q * h
 
-        h_a = torch.sum(a_q * h_aug, -2)
-
-        h_a = h_a.expand(-1, JX, -1)
-
-        h_0_u_a = h * u_a  # [None, JX, d_en]
-        h_0_h_a = h * h_a  # [None, JX, d_en]
-        return torch.cat([h, u_a, h_0_u_a, h_0_h_a],2)
+        h_0_u_a = h * u_hat  # [None, JX, d_en]
+        h_0_h_a = h * h_hat  # [None, JX, d_en]
+        return torch.cat([h, u_hat, h_0_u_a, h_0_h_a],2)
 
     # this function is from https://github.com/allenai/bi-att-flow/tree/master/my/tensorflow
     # def get_logits(args, size, bias, bias_start=0.0, scope=None, mask=None, wd=0.0, input_keep_prob=1.0, is_train=None, func=None):
@@ -251,16 +254,19 @@ class Attention(nn.Module):
         pass
 
     def forward(self, h, u, h_mask, u_mask, JX, JQ, dropout = 1.0):
-        return self.calculate_pytorch(h, u, h_mask, u_mask, JX, JQ, dropout = 1.0)
+        return self.calculate_pytorch(h, u, h_mask, u_mask, JX, J)
 
 class Encoder(nn.Module):
-    def __init__(self, input_size, state_size, dropout = 0):
+    def __init__(self, input_size, state_size,bidirectional ,dropout = 0):
         super(Encoder,self).__init__()
         self.input_size = input_size
         self.state_size = state_size
+        self.bidirectional = bidirectional
         #self.dropout = dropout
         #logging.info("Dropout rate for encoder: {}".format(self.dropout))
-        self.lstm = nn.LSTM(self.input_size,self.state_size,bidirectional=True,dropout=dropout)
+
+        # debug forward: set input_size to 1
+        self.lstm = nn.LSTM(self.input_size,self.state_size,bidirectional=bidirectional,dropout=dropout)
 
     # def encode(self, inputs, mask, encoder_state_input, dropout = 1.0):
     #     """
@@ -314,27 +320,56 @@ class Encoder(nn.Module):
     #     logging.debug('Concatenated bi-LSTM final hidden state: %s' % str(concat_final_state))
     #     return hidden_state, concat_final_state, (final_state_fw, final_state_bw)
 
-    def forward(self, inputs, mask, init_hidden_state, dropout = 1.0):
+    def forward(self, inputs, seq_len, init_hidden_state):
 
-        h_0 = None
-        c_0 = None
+        batch_size = inputs.size()[0]
+        if self.bidirectional == True:
+            # TODO not hard code num layers
+            h_0 = Var(torch.zeros(2,batch_size,self.state_size))
+            c_0 = Var(torch.zeros(2,batch_size,self.state_size))
+        else:
+            h_0 = Var(torch.zeros(1,batch_size,self.state_size))
+            c_0 = Var(torch.zeros(1,batch_size,self.state_size))
+
         if init_hidden_state is not None:
             h_0, c_0 = init_hidden_state
 
-        sequence_length = torch.sum(mask.int(), 1)
-        sequence_length = sequence_length.view(-1, )
-        packed = pack_padded_sequence(inputs, sequence_length)
-        outputs, hidden = self.lstm(packed, h_0,c_0)
-        outputs, output_lengths = pad_packed_sequence(outputs)
 
-        return outputs, hidden
+        indices = np.argsort(-seq_len)
+        sorted_seq_len = seq_len[indices]
+        indices = Var(torch.LongTensor(indices))
+
+        # debug forward set view(-1,1)
+        # TODO use index_select to do sort and recover
+        expand_indices = indices.view(-1,1,1).expand(inputs.size())
+        sorted_inputs = torch.gather(inputs,0,expand_indices)
+
+        # debug for forward
+        # sorted_inputs = sorted_inputs.unsqueeze(-1).float()
+
+        packed = pack_padded_sequence(sorted_inputs, sorted_seq_len.tolist(),batch_first=True)
+        sorted_outputs, sorted_hidden = self.lstm(packed,(h_0,c_0))
+        sorted_outputs, output_lengths = pad_packed_sequence(sorted_outputs,batch_first=True)
+
+        # debug for forward
+        # expand_indices = expand_indices.unsqueeze(-1).expand(sorted_outputs.size())
+
+        # recover to unsorted outputs
+        # debug forward set view(-1,1)
+        expand_indices = indices.view(-1,1,1).expand_as(sorted_outputs)
+        outputs = Var(torch.zeros(sorted_outputs.size())).scatter_(0,expand_indices,sorted_outputs)
+
+        return outputs
 
 class Decoder(nn.Module):
     def __init__(self, output_size, state_size,dropout):
         super(Decoder,self).__init__()
         self.output_size = output_size
         self.state_size = state_size
-        self.lstm = nn.LSTM(output_size,state_size,bidirectional=True,dropout=dropout)
+        self.m_lstm = nn.LSTM(output_size,state_size,num_layers=2,bidirectional=True,dropout=dropout)
+        self.m2_lstm = nn.LSTM(state_size,state_size,bidirectional=True,dropout=dropout)
+        self.wp_1 = nn.Linear(state_size*10,1,bias=False)
+        self.wp_2 = nn.Linear(state_size*10,1,bias=False)
         self.softmax = nn.Softmax()
 
     # def decode(self, g, context_mask, JX, dropout = 1.0):
@@ -384,30 +419,29 @@ class Decoder(nn.Module):
         the end of the answer span.
         m_2 = bi_LSTM*2(g)
         """
-        d_de = self.state_size * 2
-        m, m_repr = \
-            self.decode_LSTM_pytorch(inputs=g, mask=context_mask, encoder_state_input=None)
-        m_2, m_2_repr = \
-            self.decode_LSTM_pytorch(inputs=m, mask=context_mask, encoder_state_input=None)
+        sequence_length = torch.sum(context_mask.int(), 1)
+        # Get lstm cell output
 
-        s = self.get_logit(m_2, JX)  # [N, JX]*2
+        packed = pack_padded_sequence(g, sequence_length)
+        m, m_hidden = self.m_lstm(packed)
+        m, m_lengths = pad_packed_sequence(m)
+
+        packed = pack_padded_sequence(m,sequence_length)
+        m2,m2_hidden = self.m2_lstm(packed)
+        m2,m2_lengths = pad_packed_sequence(m2)
+
+
         # or s, e = self.get_logit_start_end(m_2) #[N, JX]*2
-        s = softmax_mask_prepro_pytorch(s, context_mask)
+        p1_logits = softmax_mask_prepro_pytorch(self.wp_1(torch.cat([g,m],2)), context_mask)
 
-        print(s.get_shape())
-
-        s_prob = self.softmax(s)
-
-        print(s_prob.get_shape())
+        p1 = self.softmax(p1_logits)
 
         # s_prob = tf.tile(tf.expand_dims(s_prob, 2), [1, 1, d_de])
-        s_prob = s_prob.expand(-1,-1,d_de)
 
-        e_input = torch.cat([m_2, m_2 * s_prob, s_prob],2)
-        e = self.get_logit(e_input, JX)  # [N, JX]*2
+        p2_logits = softmax_mask_prepro_pytorch(self.wp_1(torch.cat([g,m2],2)), context_mask)
+        p2 = self.softmax(p2_logits)
 
-        e = softmax_mask_prepro_pytorch(e, context_mask)
-        return (s, e)
+        return (p1, p2)
 
     # def decode_LSTM(self, inputs, mask, encoder_state_input, dropout = 1.0, output_dropout = False):
     #     logging.debug('-'*5 + 'decode_LSTM' + '-'*5)
@@ -449,24 +483,6 @@ class Decoder(nn.Module):
     #     concat_final_state = tf.concat(1, [final_state_fw[1], final_state_bw[1]])
     #     logging.debug('Concatenated bi-LSTM final hidden state: %s' % str(concat_final_state))
     #     return hidden_state, concat_final_state, (final_state_fw, final_state_bw)
-
-    def decode_LSTM_pytorch(self, inputs, mask, encoder_state_input):
-
-        h_0 = None
-        c_0 = None
-        if encoder_state_input is not None:
-            h_0, c_0 = encoder_state_input
-
-        sequence_length = torch.sum(mask.int(),1)
-        sequence_length = sequence_length.view([-1, ])
-        sequence_length = sequence_length.view(-1,)
-        # Get lstm cell output
-
-        packed = pack_padded_sequence(inputs, sequence_length)
-        outputs, hidden = self.lstm(packed, h_0, c_0)
-        outputs, output_lengths = pad_packed_sequence(outputs)
-
-        return outputs, hidden
 
     # def get_logit(self, X, JX):
     #     d = X.get_shape().as_list()[-1]
@@ -510,11 +526,11 @@ class QASystem(nn.Module):
         super(QASystem, self).__init__()
         self.pretrained_embeddings = pretrained_embeddings
         self.emb_layer = nn.Embedding(config.vocab_size, config.embedding_size)
-        self.q_encoder = Encoder(config.embedding_size, config.encoder_state_size,config.dropout)
-        self.c_encoder = Encoder(config.embedding_size, config.encoder_state_size,config.dropout)
+        self.q_encoder = Encoder(config.embedding_size, config.encoder_state_size,config.encoder_bidirectional,config.dropout)
+        self.c_encoder = Encoder(config.embedding_size, config.encoder_state_size,config.encoder_bidirectional,config.dropout)
 
         self.decoder = Decoder(config.output_size, config.decoder_state_size,config.dropout)
-        self.attention = Attention()
+        self.attention = Attention(config)
         self.config = config
 
         # ==== set up placeholder tokens ====
@@ -553,9 +569,10 @@ class QASystem(nn.Module):
         # TODO : tensorboard
         # self.merged = tf.summary.merge_all()
 
-    def forward(self, q,c,c_mask,q_mask):
+    def forward(self, q,c,c_len,q_len,JX,JQ):
+        # debug encoder forward : annotate next line
         q, c = self.setup_embeddings_pytorch(q,c)
-        preds = self.setup_system_pytorch(c, q,c_mask,q_mask)
+        preds = self.setup_system_pytorch(c, q,c_len,q_len)
 
         return preds
 
@@ -611,8 +628,7 @@ class QASystem(nn.Module):
     #     pred1, pred2 = self.decoder.decode(g, self.context_mask_placeholder, dropout = self.dropout_placeholder, JX = self.JX)
     #     return pred1, pred2
 
-    def setup_system_pytorch(self, c, q,c_mask,q_mask):
-        d = c.get_shape().as_list()[-1]  # self.config.embedding_size
+    def setup_system_pytorch(self, c, q,c_len,q_len):
         #   x: [None, JX, d]
         #   q: [None, JQ, d]
 
@@ -620,18 +636,11 @@ class QASystem(nn.Module):
         #         e.g. u = encode_question(q)  # get U (2d*J) as representation of q
         #         e.g. h = encode_context(x, u_state)   # get H (2d*T) as representation of x
 
-        u, question_repr = \
-            self.q_encoder(inputs=q, mask=q_mask, encoder_state_input=None,
-                           dropout=self.config.dropout)
+        u = self.q_encoder(inputs=q, seq_len=q_len, init_hidden_state=None)
         if self.config.QA_ENCODER_SHARE:
-            h, context_repr = \
-                self.c_encoder(inputs=c, mask=c_mask, encoder_state_input=None,
-                                    dropout=self.config.dropout)
+            h, context_repr = self.q_encoder(inputs=c, seq_len=c_len, init_hidden_state=None)
         if not self.config.QA_ENCODER_SHARE:
-            h, context_repr = \
-                self.c_encoder(inputs=c, mask=c_mask, encoder_state_input=None,
-                                    dropout=self.config.dropout)
-            # self.encoder.encode(inputs=x, mask=self.context_mask_placeholder, encoder_state_input=None)
+            h, context_repr = self.c_encoder(inputs=c, seq_len=c_len, init_hidden_state=None)
 
         # Step 2: combine H and U using "Attention"
         #         e.g. s = h.T * u
@@ -641,13 +650,13 @@ class QASystem(nn.Module):
         #              h_hat = sum(a_q*h)
         #              g = combine(u, h, u_hat, h_hat)
         # --------op1--------------
-        g = self.attention(h, u, c_mask, q_mask, JX=self.JX,
-                                     JQ=self.JQ, dropout=self.config.dropout)  # concat[h, u_a, h*u_a, h*h_a]
+        g = self.attention(h, u, c_len, q_len, JX=self.JX,
+                                     JQ=self.JQ)  # concat[h, u_a, h*u_a, h*h_a]
 
         # Step 3:
         # 2 LSTM layers
         # logistic regressions
-        pred1, pred2 = self.decoder(g, c_mask, JX=self.JX)
+        pred1, pred2 = self.decoder(g, c_len, JX=self.JX)
         return pred1, pred2
 
     # def setup_embeddings(self):
@@ -671,10 +680,8 @@ class QASystem(nn.Module):
             self.emb_layer.weight.requires_grad = False
 
         q_emb = self.emb_layer(q).float()
-        q_emb = q_emb.view(-1, self.JQ, self.config.embedding_size)
 
         c_emb = self.emb_layer(c).float()
-        c_emb = c_emb.view(-1, self.JX, self.config.embedding_size)
 
         return q_emb, c_emb
 

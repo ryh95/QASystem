@@ -21,14 +21,9 @@ class Trainer(object):
 
     # helper function for training
     def train(self, dataset,vocab):
-        tic = time.time()
         # TODO:pytorch get trainable paras
         # params = tf.trainable_variables()
         # num_params = sum(map(lambda t: np.prod(tf.shape(t.value()).eval()), params))
-        num_params = self.model.parameters()
-        toc = time.time()
-
-        logging.info("Number of params: %d (retreival took %f secs)" % (num_params, toc - tic))
 
         training_set = dataset['training']  # [question, len(question), context, len(context), answer]
         validation_set = dataset['validation']
@@ -141,11 +136,16 @@ class Trainer(object):
         for i, batch in enumerate(minibatches(training_set, self.args.batch_size, window_batch = self.args.window_batch)):
             global_batch_num = batch_num * epoch_num + i
 
-            question_batch, question_len_batch, context_batch, context_len_batch, answer_batch = training_set
+            question_batch, question_len_batch, context_batch, context_len_batch, answer_batch = batch
             data_dict = self.create_feed_dict(question_batch, question_len_batch, context_batch, context_len_batch,
                                                answer_batch=answer_batch, is_train=True)
 
-            preds = self.model(data_dict['q'],data_dict['c'],data_dict['c_mask'],data_dict['q_mask'])
+            q_var = Var(torch.LongTensor(data_dict['q']))
+            c_var = Var(torch.LongTensor(data_dict['c']))
+            JX = data_dict['JX']
+            JQ = data_dict['JQ']
+
+            preds = self.model(q_var,c_var,context_len_batch,question_len_batch,JX,JQ)
 
             loss = self.criterion(preds,(data_dict['ans_start'],data_dict['ans_end']))
             loss.backward()
@@ -268,18 +268,18 @@ class Trainer(object):
         logging.info("Average validation loss: {}".format(avg_loss))
         return avg_loss
 
-    def setup_loss(self, preds):
-        with vs.variable_scope("loss"):
-            s, e = preds # [None, JX]*2
-            assert s.get_shape().ndims == 2
-            assert e.get_shape().ndims == 2
-            loss1 = tf.reduce_sum(tf.nn.sparse_softmax_cross_entropy_with_logits(logits=s, labels=self.answer_start_placeholders),)
-            loss2 = tf.reduce_sum(tf.nn.sparse_softmax_cross_entropy_with_logits(logits=e, labels=self.answer_end_placeholders),)
-            # loss1 = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=s, labels=self.answer_start_placeholders),)
-            # loss2 = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=e, labels=self.answer_end_placeholders),)
-        loss = loss1 + loss2
-        tf.summary.scalar('loss', loss)
-        return loss
+    # def setup_loss(self, preds):
+    #     with vs.variable_scope("loss"):
+    #         s, e = preds # [None, JX]*2
+    #         assert s.get_shape().ndims == 2
+    #         assert e.get_shape().ndims == 2
+    #         loss1 = tf.reduce_sum(tf.nn.sparse_softmax_cross_entropy_with_logits(logits=s, labels=self.answer_start_placeholders),)
+    #         loss2 = tf.reduce_sum(tf.nn.sparse_softmax_cross_entropy_with_logits(logits=e, labels=self.answer_end_placeholders),)
+    #         # loss1 = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=s, labels=self.answer_start_placeholders),)
+    #         # loss2 = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=e, labels=self.answer_end_placeholders),)
+    #     loss = loss1 + loss2
+    #     tf.summary.scalar('loss', loss)
+    #     return loss
 
     def setup_loss_pytorch(self,preds):
         s, e = preds  # [None, JX]*2
