@@ -683,9 +683,6 @@ class QASystem(nn.Module):
     #     return question_embeddings, context_embeddings
 
     def setup_embeddings_pytorch(self,q,c):
-        if not self.config.RE_TRAIN_EMBED:
-            self.emb_layer.weight = nn.Parameter(torch.from_numpy(self.pretrained_embeddings))
-            self.emb_layer.weight.requires_grad = False
 
         q_emb = self.emb_layer(q).float()
 

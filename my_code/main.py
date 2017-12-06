@@ -27,27 +27,30 @@ from my_code.utils.data_reader import read_data, load_glove_embeddings
 logging.basicConfig(level=logging.INFO)
 
 
-def initialize_model(model, ckpt_dir):
-    # ckpt = tf.train.get_checkpoint_state(train_dir)
-    if pexists(ckpt_dir):
-        ckpt = torch.load(ckpt_dir)
-        logging.info("Reading model parameters from %s" % ckpt.model_checkpoint_path)
-        # saver = tf.train.Saver()
-        # saver.restore(session, ckpt.model_checkpoint_path)
-        # TODO: load model
+def load_ckpt(model, args):
+    ckpt = pjoin(args.ckpt_dir,args.expname)
+    if pexists(args.ckpt_dir):
+        if pexists(ckpt):
+            model_para = torch.load(ckpt)
+            logging.info("Reading model parameters from %s" % ckpt)
+            # saver = tf.train.Saver()
+            # saver.restore(session, ckpt.model_checkpoint_path)
+            # TODO: load model
+        else:
+            logging.info("Try to load ckpt but didn't found, start with fresh paras")
     else:
-        logging.info("Created model with fresh parameters.")
-        # session.run(tf.global_variables_initializer())
-        # logging.info('Num params: %d' % sum(v.get_shape().num_elements() for v in tf.trainable_variables()))
-        logging.info("Print model")
-        # TODO: how to calculate num parameters in a model?
-        logging.info(model)
-        all_paras = 0
-        for para in model.parameters():
-            all_paras += torch.numel(para.data)
-        logging.info("Num paras: {}".format(all_paras))
+        os.makedirs(args.ckpt_dir)
+        logging.info("Checkpoint directory doesn't exist, create it")
+
     return model
 
+def print_model_detail(model):
+    logging.info("Print model")
+    logging.info(model)
+    all_paras = 0
+    for para in model.parameters():
+        all_paras += torch.numel(para.data)
+    logging.info("Num paras: {}".format(all_paras))
 
 def initialize_vocab(vocab_path):
     if pexists(vocab_path):
@@ -81,7 +84,12 @@ if __name__ == "__main__":
     args.vocab_size = len(vocab)
 
     qa = QASystem(embeddings, args)
-    print('model initialized!')
+    if not args.RE_TRAIN_EMBED:
+        qa.emb_layer.weight = nn.Parameter(torch.from_numpy(embeddings))
+        qa.emb_layer.weight.requires_grad = False
+    qa_parameters = filter(lambda p: p.requires_grad, qa.parameters())
+
+    logging.info('model initialized!')
     #
     # if not os.path.exists(args.log_dir):
     #     os.makedirs(args.log_dir)
@@ -96,16 +104,18 @@ if __name__ == "__main__":
     # # gpu_options.allow_growth=True
     #
     # # with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
-    qa = initialize_model(qa, args.ckpt_dir)
-    #
-    # qa.train(dataset, save_train_dir, rev_vocab)
+
+    qa = load_ckpt(qa, args)
+    print_model_detail(qa)
+
     criterion = nn.NLLLoss()
+
     if args.optimizer=='adam':
-        optimizer   = optim.Adam(qa.parameters(), lr=args.lr)
+        optimizer   = optim.Adam(qa_parameters, lr=args.lr)
     elif args.optimizer=='adagrad':
-        optimizer   = optim.Adagrad(qa.parameters(), lr=args.lr)
+        optimizer   = optim.Adagrad(qa_parameters, lr=args.lr)
     elif args.optimizer=='sgd':
-        optimizer   = optim.SGD(qa.parameters(), lr=args.lr)
+        optimizer   = optim.SGD(qa_parameters, lr=args.lr)
 
     trainer = Trainer(args, qa, criterion, optimizer)
-    trainer.train(dataset,vocab)
+    trainer.train(dataset,rev_vocab)

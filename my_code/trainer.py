@@ -1,3 +1,4 @@
+from os.path import join as pjoin
 import numpy as np
 import time
 from tqdm import tqdm
@@ -20,7 +21,7 @@ class Trainer(object):
         self.epoch      = 0
 
     # helper function for training
-    def train(self, dataset,vocab):
+    def train(self, dataset, id2word):
         # TODO:pytorch get trainable paras
         # params = tf.trainable_variables()
         # num_params = sum(map(lambda t: np.prod(tf.shape(t.value()).eval()), params))
@@ -36,22 +37,23 @@ class Trainer(object):
         for epoch in range(self.args.epochs):
             logging.info("=" * 10 + " Epoch %d out of %d " + "=" * 10, epoch + 1, self.args.epochs)
 
-            # TODO run training
-            score = self.run_epoch(epoch, training_set, vocab, validation_set,
-                                   sample_size=self.args.evaluate_sample_size)
+            score = self.train_epoch(epoch, training_set, id2word, validation_set,
+                                     sample_size=self.args.evaluate_sample_size)
             logging.info("-- validation --")
             # TODO validate answer
-            val_loss = self.validate(validation_set)
+            # val_loss = self.validate(validation_set)
 
             # TODO get f1 and em
-            f1, em = self.evaluate_answer(validation_set, vocab,
-                                          sample=self.args.model_selection_sample_size, log=True)
+            f1, em = self.evaluate(validation_set, id2word,
+                                   sample=self.args.model_selection_sample_size, log=True)
 
             # TODO Saving the model
             if f1 > f1_best:
+                f1_best = f1
                 checkpoint = {'model': self.model.state_dict(), 'optim': self.optimizer,
                               'args': self.args, 'epoch': epoch}
-                torch.save(checkpoint, '%s.pt' % self.args.check_path)
+                ckpt = pjoin(self.args.ckpt_dir,self.args.expname)
+                torch.save(checkpoint, '%s.pt' % ckpt)
                 logging.info('New best f1 in val set')
                 logging.info('')
 
@@ -123,7 +125,7 @@ class Trainer(object):
 
         return data_dict
 
-    def run_epoch(self, epoch_num, training_set, vocab, validation_set, sample_size=400):
+    def train_epoch(self, epoch_num, training_set, id2word, validation_set, sample_size=400):
         set_num = len(training_set)
         batch_size = self.args.batch_size
         batch_num = int(np.ceil(set_num * 1.0 / batch_size))
@@ -166,16 +168,17 @@ class Trainer(object):
             #     self.train_writer.add_summary(summary, global_batch_num)
 
             if (i+1) % self.args.log_batch_num == 0:
-                logging.info('')
+                logging.info('Evaluate in training')
                 # TODO check evaluate_answer
-                self.evaluate_answer(training_set, vocab, sample=sample_size, log=True)
-                self.evaluate_answer(validation_set, vocab, sample=sample_size, log=True)
+                self.evaluate(training_set, id2word, sample=sample_size, log=True)
+                logging.info('Evaluate in validation')
+                self.evaluate(validation_set, id2word, sample=sample_size, log=True)
             avg_loss += loss.data[0]
         avg_loss /= batch_num
-        logging.info("Average training loss: {}".format(avg_loss))
+        logging.info("Average training loss: {} , for {} batches".format(avg_loss,batch_num))
         return avg_loss
 
-    def evaluate_answer(self, dataset, vocab, sample=400, log=False):
+    def evaluate(self, dataset, id2word, sample=400, log=False):
         f1 = 0.
         em = 0.
 
@@ -187,7 +190,7 @@ class Trainer(object):
         for example, (start, end) in zip(evaluate_set, predicts):
             q, _, c, _, (true_s, true_e) = example
             # print (start, end, true_s, true_e)
-            context_words = [vocab[w] for w in c]
+            context_words = [id2word[w] for w in c]
 
             true_answer = ' '.join(context_words[true_s : true_e + 1])
             if start <= end:
@@ -215,11 +218,21 @@ class Trainer(object):
         question_batch, question_len_batch, context_batch, context_len_batch, answer_batch = validation_set
         data_dict = self.create_feed_dict(question_batch, question_len_batch, context_batch, context_len_batch, answer_batch=answer_batch, is_train = False)
 
-        # output_feed = [self.loss]
-        # outputs = session.run(output_feed, input_feed)
-        preds = self.model(data_dict['q'], data_dict['c'], data_dict['c_mask'], data_dict['q_mask'])
+        q_var = Var(torch.LongTensor(data_dict['q']))
+        c_var = Var(torch.LongTensor(data_dict['c']))
+        q_mask = Var(torch.IntTensor(data_dict['q_mask']))
+        c_mask = Var(torch.IntTensor(data_dict['c_mask']))
+        # change numpy data type to python
+        JX = data_dict['JX'].item()
+        JQ = data_dict['JQ'].item()
+        ans_start = Var(torch.LongTensor(data_dict['ans_start'].tolist()))
+        ans_end = Var(torch.LongTensor(data_dict['ans_end'].tolist()))
 
-        loss = self.criterion(preds, (data_dict['ans_start'], data_dict['ans_end']))
+        pred_start, pred_end = self.model(q_var, c_var, question_len_batch, context_len_batch, q_mask, c_mask, JQ, JX)
+
+        loss1 = self.criterion(pred_start, ans_start)
+        loss2 = self.criterion(pred_end, ans_end)
+        loss = loss1 + loss2
 
         return loss
 
@@ -235,10 +248,17 @@ class Trainer(object):
 
         question_batch, question_len_batch, context_batch, context_len_batch, answer_batch = test_batch
         data_dict =  self.create_feed_dict(question_batch, question_len_batch, context_batch, context_len_batch, answer_batch=None, is_train = False)
-        # outputs = session.run(output_feed, input_feed)
-        preds = self.model(data_dict['q'], data_dict['c'], data_dict['c_mask'], data_dict['q_mask'])
 
-        s, e = preds
+        q_var = Var(torch.LongTensor(data_dict['q']))
+        c_var = Var(torch.LongTensor(data_dict['c']))
+        q_mask = Var(torch.IntTensor(data_dict['q_mask']))
+        c_mask = Var(torch.IntTensor(data_dict['c_mask']))
+        # change numpy data type to python
+        JX = data_dict['JX'].item()
+        JQ = data_dict['JQ'].item()
+
+        s, e = self.model(q_var, c_var, question_len_batch, context_len_batch, q_mask, c_mask, JQ, JX)
+        s, e = s.data.numpy(),e.data.numpy()
 
         best_spans, scores = zip(*[get_best_span(si, ei, ci) for si, ei, ci in zip(s, e, context_batch)])
         return best_spans
@@ -288,17 +308,6 @@ class Trainer(object):
     #     loss = loss1 + loss2
     #     tf.summary.scalar('loss', loss)
     #     return loss
-
-    def setup_loss_pytorch(self,preds):
-        s, e = preds  # [None, JX]*2
-        # loss1 = tf.reduce_sum(tf.nn.sparse_softmax_cross_entropy_with_logits(logits=s, labels=self.answer_start_placeholders),)
-        # loss2 = tf.reduce_sum(tf.nn.sparse_softmax_cross_entropy_with_logits(logits=e, labels=self.answer_end_placeholders),)
-        # TODO: get NLL loss
-        loss1 = torch.sum()
-        loss2 = torch.sum()
-        loss = loss1 + loss2
-        # TODO: add loss to tf-board to visualize
-        return loss
 
     # with gradient clipping
     def get_optimizer_pytorch(opt, loss, max_grad_norm, learning_rate):
