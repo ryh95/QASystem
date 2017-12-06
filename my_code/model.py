@@ -67,16 +67,17 @@ logging.basicConfig(level=logging.INFO)
 
 def softmax_mask_prepro_pytorch(tensor,mask):
     m0 = mask - 1.0
-    paddings = m0 * (1e10)
+    paddings = m0 * (1e5)
     # TODO use plus instead of select may have bugs, if then need to fix after
     # tensor = torch.select(mask, tensor, paddings)
-    tensor += paddings
+    tensor += paddings.float()
     return tensor
 
 class Attention(nn.Module):
     def __init__(self,config):
         super(Attention,self).__init__()
-        self.softmax = nn.Softmax()
+        self.a_t_softmax = nn.Softmax(dim=2)
+        self.b_softmax = nn.Softmax(dim=1)
         self.config = config
 
     # def calculate(self, h, u, h_mask, u_mask, JX, JQ, dropout = 1.0):
@@ -154,8 +155,8 @@ class Attention(nn.Module):
         # # get similarity
         # h_aug = h.view(-1, JX, 1, d_en).expand(-1, -1, JQ, -1)
         # u_aug = u.view(-1, 1, JQ, d_en).expand(-1, JX, -1, -1)
-        h_mask_aug = h_mask.expand(-1, -1, JQ)
-        u_mask_aug = u_mask.expand(-1, JX, -1)
+        h_mask_aug = h_mask.unsqueeze(-1).expand(-1,JX,JQ)
+        u_mask_aug = u_mask.unsqueeze(1).expand(-1, JX,JQ)
         hu_mask_aug = h_mask_aug & u_mask_aug
 
         # TODO : first use vanilla cos similarity, then can use some NN like the Bidaf paper
@@ -166,9 +167,12 @@ class Attention(nn.Module):
 
         s = softmax_mask_prepro_pytorch(s, hu_mask_aug)
 
-        # get a_x
+        # test for softmax
+        # print(self.softmax(Var(torch.tensor([[55,1],[55,1]]))))
+
+        # get a_t
         # should be row softmax
-        a_x = self.softmax(s)
+        a_t = self.a_t_softmax(s)
 
         # use a_x to get u_a
         if self.config.encoder_bidirectional == True:
@@ -176,22 +180,19 @@ class Attention(nn.Module):
         else:
             d_en = self.config.encoder_state_size
 
-        a_x = a_x.expand(-1, JX, JQ, d_en)
+        a_t = a_t.unsqueeze(-1).expand(-1, JX, JQ, d_en)
+        u_expand = u.unsqueeze(1).expand(-1, JX, JQ, d_en)
 
-        u_aug = u.expand(-1, JX, JQ, d_en)
+        u_tilde = torch.sum(a_t * u_expand, 2)
 
-        u_hat = torch.sum(a_x * u_aug, 1)
-
-        # get a_q
-        a_q = torch.max(s, -1,keep_dim=True)
-        a_q = self.softmax(a_q)
+        # get b
+        b,_ = torch.max(s, -1,keepdim=True)
+        b = self.b_softmax(b)
         #     use a_q to get h_a
 
-        h_hat = a_q * h
+        h_tilde = torch.sum(b * h,1,keepdim=True).expand(-1,JX,d_en)
 
-        h_0_u_a = h * u_hat  # [None, JX, d_en]
-        h_0_h_a = h * h_hat  # [None, JX, d_en]
-        return torch.cat([h, u_hat, h_0_u_a, h_0_h_a],2)
+        return torch.cat([h, u_tilde, h*u_tilde, h*h_tilde],2)
 
     # this function is from https://github.com/allenai/bi-att-flow/tree/master/my/tensorflow
     # def get_logits(args, size, bias, bias_start=0.0, scope=None, mask=None, wd=0.0, input_keep_prob=1.0, is_train=None, func=None):
@@ -253,8 +254,8 @@ class Attention(nn.Module):
         # TODO finish this function
         pass
 
-    def forward(self, h, u, h_mask, u_mask, JX, JQ, dropout = 1.0):
-        return self.calculate_pytorch(h, u, h_mask, u_mask, JX, J)
+    def forward(self, h, u, h_mask, u_mask, JX, JQ):
+        return self.calculate_pytorch(h, u, h_mask, u_mask, JX, JQ)
 
 class Encoder(nn.Module):
     def __init__(self, input_size, state_size,bidirectional ,dropout = 0):
@@ -366,11 +367,11 @@ class Decoder(nn.Module):
         super(Decoder,self).__init__()
         self.output_size = output_size
         self.state_size = state_size
-        self.m_lstm = nn.LSTM(output_size,state_size,num_layers=2,bidirectional=True,dropout=dropout)
-        self.m2_lstm = nn.LSTM(state_size,state_size,bidirectional=True,dropout=dropout)
+        self.m_lstm = nn.LSTM(state_size*8,state_size,num_layers=2,bidirectional=True,dropout=dropout)
+        self.m2_lstm = nn.LSTM(state_size*2,state_size,bidirectional=True,dropout=dropout)
         self.wp_1 = nn.Linear(state_size*10,1,bias=False)
         self.wp_2 = nn.Linear(state_size*10,1,bias=False)
-        self.softmax = nn.Softmax()
+        self.softmax = nn.LogSoftmax(dim=1)
 
     # def decode(self, g, context_mask, JX, dropout = 1.0):
     #     """
@@ -410,7 +411,7 @@ class Decoder(nn.Module):
         # e = softmax_mask_prepro(e, context_mask)
         # return (s, e)
 
-    def decode_pytorch(self, g, context_mask, JX):
+    def decode_pytorch(self, g, c_len,c_mask):
         """
         takes in a knowledge representation
         and output a probability estimation over
@@ -419,26 +420,34 @@ class Decoder(nn.Module):
         the end of the answer span.
         m_2 = bi_LSTM*2(g)
         """
-        sequence_length = torch.sum(context_mask.int(), 1)
+        indices = np.argsort(-c_len)
+        sorted_seq_len = c_len[indices]
+        indices = Var(torch.LongTensor(indices))
         # Get lstm cell output
 
-        packed = pack_padded_sequence(g, sequence_length)
-        m, m_hidden = self.m_lstm(packed)
-        m, m_lengths = pad_packed_sequence(m)
+        expand_indices = indices.view(-1, 1, 1).expand(g.size())
+        sorted_g = torch.gather(g, 0, expand_indices)
 
-        packed = pack_padded_sequence(m,sequence_length)
-        m2,m2_hidden = self.m2_lstm(packed)
-        m2,m2_lengths = pad_packed_sequence(m2)
+        packed = pack_padded_sequence(sorted_g, sorted_seq_len.tolist(), batch_first=True)
+        sorted_m, _ = self.m_lstm(packed)
+        sorted_m, _ = pad_packed_sequence(sorted_m, batch_first=True)
 
+        # recover to unsorted outputs
+        expand_indices = indices.view(-1, 1, 1).expand_as(sorted_m)
+        m = Var(torch.zeros(sorted_m.size())).scatter_(0, expand_indices, sorted_m)
+
+        packed = pack_padded_sequence(sorted_m,sorted_seq_len.tolist(), batch_first=True)
+        sorted_m2,_ = self.m2_lstm(packed)
+        sorted_m2,_ = pad_packed_sequence(sorted_m2,batch_first=True)
+
+        expand_indices = indices.view(-1, 1, 1).expand_as(sorted_m2)
+        m2 = Var(torch.zeros(sorted_m2.size())).scatter_(0, expand_indices, sorted_m2)
 
         # or s, e = self.get_logit_start_end(m_2) #[N, JX]*2
-        p1_logits = softmax_mask_prepro_pytorch(self.wp_1(torch.cat([g,m],2)), context_mask)
-
+        p1_logits = softmax_mask_prepro_pytorch(self.wp_1(torch.cat([g,m],2)).squeeze(-1), c_mask)
         p1 = self.softmax(p1_logits)
 
-        # s_prob = tf.tile(tf.expand_dims(s_prob, 2), [1, 1, d_de])
-
-        p2_logits = softmax_mask_prepro_pytorch(self.wp_1(torch.cat([g,m2],2)), context_mask)
+        p2_logits = softmax_mask_prepro_pytorch(self.wp_2(torch.cat([g,m2],2)).squeeze(-1), c_mask)
         p2 = self.softmax(p2_logits)
 
         return (p1, p2)
@@ -511,8 +520,8 @@ class Decoder(nn.Module):
     #     pred2 = tf.matmul(pred2_1, W_se)+b_se
     #     return pred1, pred2
 
-    def forward(self, g, context_mask, JX):
-        return self.decode_pytorch(g, context_mask, JX)
+    def forward(self, g, c_len, c_mask):
+        return self.decode_pytorch(g, c_len, c_mask)
 
 class QASystem(nn.Module):
     def __init__(self, pretrained_embeddings, config):
@@ -569,10 +578,10 @@ class QASystem(nn.Module):
         # TODO : tensorboard
         # self.merged = tf.summary.merge_all()
 
-    def forward(self, q,c,c_len,q_len,JX,JQ):
+    def forward(self, q,c,q_len,c_len,q_mask,c_mask,JQ,JX):
         # debug encoder forward : annotate next line
         q, c = self.setup_embeddings_pytorch(q,c)
-        preds = self.setup_system_pytorch(c, q,c_len,q_len)
+        preds = self.setup_system_pytorch(c, q,c_len,q_len,c_mask,q_mask,JX,JQ)
 
         return preds
 
@@ -628,7 +637,7 @@ class QASystem(nn.Module):
     #     pred1, pred2 = self.decoder.decode(g, self.context_mask_placeholder, dropout = self.dropout_placeholder, JX = self.JX)
     #     return pred1, pred2
 
-    def setup_system_pytorch(self, c, q,c_len,q_len):
+    def setup_system_pytorch(self, c, q,c_len,q_len,c_mask,q_mask,JX,JQ):
         #   x: [None, JX, d]
         #   q: [None, JQ, d]
 
@@ -638,9 +647,9 @@ class QASystem(nn.Module):
 
         u = self.q_encoder(inputs=q, seq_len=q_len, init_hidden_state=None)
         if self.config.QA_ENCODER_SHARE:
-            h, context_repr = self.q_encoder(inputs=c, seq_len=c_len, init_hidden_state=None)
+            h = self.q_encoder(inputs=c, seq_len=c_len, init_hidden_state=None)
         if not self.config.QA_ENCODER_SHARE:
-            h, context_repr = self.c_encoder(inputs=c, seq_len=c_len, init_hidden_state=None)
+            h = self.c_encoder(inputs=c, seq_len=c_len, init_hidden_state=None)
 
         # Step 2: combine H and U using "Attention"
         #         e.g. s = h.T * u
@@ -650,13 +659,12 @@ class QASystem(nn.Module):
         #              h_hat = sum(a_q*h)
         #              g = combine(u, h, u_hat, h_hat)
         # --------op1--------------
-        g = self.attention(h, u, c_len, q_len, JX=self.JX,
-                                     JQ=self.JQ)  # concat[h, u_a, h*u_a, h*h_a]
+        g = self.attention(h, u, c_mask, q_mask, JX=JX,JQ=JQ)  # concat[h, u_a, h*u_a, h*h_a]
 
         # Step 3:
         # 2 LSTM layers
         # logistic regressions
-        pred1, pred2 = self.decoder(g, c_len, JX=self.JX)
+        pred1, pred2 = self.decoder(g, c_len, c_mask)
         return pred1, pred2
 
     # def setup_embeddings(self):

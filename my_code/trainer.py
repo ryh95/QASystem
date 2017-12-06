@@ -82,11 +82,11 @@ class Trainer(object):
         JX = np.max(context_len_batch)
         # print('This batch len: JX = %d, JQ = %d', JX, JQ)
         def add_paddings(sentence, max_length):
-            mask = [True] * len(sentence)
+            mask = [1] * len(sentence)
             pad_len = max_length - len(sentence)
             if pad_len > 0:
                 padded_sentence = sentence + [0] * pad_len
-                mask += [False] * pad_len
+                mask += [0] * pad_len
             else:
                 padded_sentence = sentence[:max_length]
                 mask = mask[:max_length]
@@ -142,12 +142,20 @@ class Trainer(object):
 
             q_var = Var(torch.LongTensor(data_dict['q']))
             c_var = Var(torch.LongTensor(data_dict['c']))
-            JX = data_dict['JX']
-            JQ = data_dict['JQ']
+            q_mask = Var(torch.IntTensor(data_dict['q_mask']))
+            c_mask = Var(torch.IntTensor(data_dict['c_mask']))
+            # change numpy data type to python
+            JX = data_dict['JX'].item()
+            JQ = data_dict['JQ'].item()
+            ans_start = Var(torch.LongTensor(data_dict['ans_start'].tolist()))
+            ans_end = Var(torch.LongTensor(data_dict['ans_end'].tolist()))
 
-            preds = self.model(q_var,c_var,context_len_batch,question_len_batch,JX,JQ)
+            pred_start,pred_end = self.model(q_var,c_var,question_len_batch,context_len_batch,q_mask,c_mask,JQ,JX)
 
-            loss = self.criterion(preds,(data_dict['ans_start'],data_dict['ans_end']))
+            loss1 = self.criterion(pred_start,ans_start)
+            loss2 = self.criterion(pred_end,ans_end)
+            loss = loss1+loss2
+
             loss.backward()
             self.optimizer.step()
             self.optimizer.zero_grad()
